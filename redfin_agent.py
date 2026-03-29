@@ -35,10 +35,13 @@ SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
 ]
 
+# Resolve paths relative to this script so cron can run it from any directory
+_DIR = os.path.dirname(os.path.abspath(__file__))
+
 # Path to your OAuth credentials file downloaded from Google Cloud Console
-CREDENTIALS_FILE = "credentials.json"
+CREDENTIALS_FILE = os.path.join(_DIR, "credentials.json")
 # Where the OAuth token is cached after first login
-TOKEN_FILE = "token.json"
+TOKEN_FILE = os.path.join(_DIR, "token.json")
 
 # Google Sheet ID — get this from the URL of your sheet:
 # https://docs.google.com/spreadsheets/d/SHEET_ID_HERE/edit
