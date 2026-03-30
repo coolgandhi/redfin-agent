@@ -14,6 +14,7 @@ Subsequent: processes only unread Redfin emails newer than the most
 import base64
 import os
 import re
+import ssl
 import time
 import json
 from datetime import datetime, timezone
@@ -27,6 +28,7 @@ from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
+from googleapiclient.errors import HttpError
 
 # ─── CONFIG ──────────────────────────────────────────────────────────────────
 
@@ -366,19 +368,38 @@ def fetch_schools(listing_url):
 
 # ─── GOOGLE SHEETS ───────────────────────────────────────────────────────────
 
+def _with_retry(fn, retries=4):
+    """Call fn() (which must call .execute() internally) with exponential backoff."""
+    for attempt in range(retries):
+        try:
+            return fn()
+        except (ssl.SSLEOFError, ssl.SSLError, OSError) as e:
+            if attempt == retries - 1:
+                raise
+            wait = 2 ** attempt
+            print(f"    ⚠ Network error ({e.__class__.__name__}), retrying in {wait}s…")
+            time.sleep(wait)
+        except HttpError as e:
+            if e.resp.status in (429, 500, 502, 503, 504) and attempt < retries - 1:
+                wait = 2 ** attempt
+                print(f"    ⚠ API error {e.resp.status}, retrying in {wait}s…")
+                time.sleep(wait)
+            else:
+                raise
+
 def ensure_header(sheets):
     """Write the header row if the sheet is empty."""
-    result = sheets.spreadsheets().values().get(
+    result = _with_retry(lambda: sheets.spreadsheets().values().get(
         spreadsheetId=SHEET_ID,
         range=f"{SHEET_TAB}!A1:T1",
-    ).execute()
+    ).execute())
     if not result.get("values"):
-        sheets.spreadsheets().values().update(
+        _with_retry(lambda: sheets.spreadsheets().values().update(
             spreadsheetId=SHEET_ID,
             range=f"{SHEET_TAB}!A1",
             valueInputOption="RAW",
             body={"values": [COLUMNS]},
-        ).execute()
+        ).execute())
 
 
 def read_sheet(sheets):
@@ -387,10 +408,10 @@ def read_sheet(sheets):
     and address_to_row_index maps normalised address → 1-based sheet row number.
     Row 1 is the header; data starts at row 2.
     """
-    result = sheets.spreadsheets().values().get(
+    result = _with_retry(lambda: sheets.spreadsheets().values().get(
         spreadsheetId=SHEET_ID,
         range=f"{SHEET_TAB}!A:T",
-    ).execute()
+    ).execute())
     rows = result.get("values", [])
     addr_idx = {}
     for i, row in enumerate(rows[1:], start=2):   # skip header
@@ -472,25 +493,25 @@ def write_listings(sheets, listings, addr_to_row):
     # Batch append all new rows in one API call
     appended = 0
     if rows_to_append:
-        sheets.spreadsheets().values().append(
+        _with_retry(lambda: sheets.spreadsheets().values().append(
             spreadsheetId=SHEET_ID,
             range=f"{SHEET_TAB}!A1",
             valueInputOption="USER_ENTERED",
             insertDataOption="INSERT_ROWS",
             body={"values": rows_to_append},
-        ).execute()
+        ).execute())
         appended = len(rows_to_append)
 
     # Batch update existing rows using batchUpdate
     updated = 0
     if update_requests:
-        sheets.spreadsheets().values().batchUpdate(
+        _with_retry(lambda: sheets.spreadsheets().values().batchUpdate(
             spreadsheetId=SHEET_ID,
             body={
                 "valueInputOption": "USER_ENTERED",
                 "data": update_requests,
             },
-        ).execute()
+        ).execute())
         updated = len(update_requests)
 
     return appended, updated
@@ -557,8 +578,34 @@ def main():
     deduped = list(addr_best.values())
     print(f"\n📊 {len(all_listings)} total listings → {len(deduped)} unique addresses\n")
 
+    # ── Build school cache from existing sheet rows ───────────────────────────
+    addr_school_cache = {}
+    for row in existing_rows[1:]:
+        if len(row) > 1 and row[1]:
+            key = normalise_address(row[1])
+            cached_schools = []
+            for j in range(3):
+                base = 10 + j * 3
+                name   = row[base]     if len(row) > base     else ""
+                kind   = row[base + 1] if len(row) > base + 1 else ""
+                rating = row[base + 2] if len(row) > base + 2 else ""
+                if name:
+                    cached_schools.append((name, kind, rating))
+            if cached_schools:
+                addr_school_cache[key] = cached_schools
+
     # ── Enrich with school data ───────────────────────────────────────────────
     for i, l in enumerate(deduped, 1):
+        key = normalise_address(l["address"])
+        cached = addr_school_cache.get(key)
+        if cached:
+            print(f"  🏫 [{i}/{len(deduped)}] {l['address']} → cached ({len(cached)} school(s))")
+            for j, (name, kind, rating) in enumerate(cached[:3], 1):
+                l[f"school{j}"] = name
+                l[f"type{j}"]   = kind
+                l[f"rating{j}"] = rating
+            continue
+
         print(f"  🏫 Fetching schools for [{i}/{len(deduped)}] {l['address']}")
         schools = fetch_schools(l["url"])
         for j, s in enumerate(schools[:3], 1):
