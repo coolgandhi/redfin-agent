@@ -122,11 +122,11 @@ def fetch_emails(gmail, query, max_results=None):
 
 def mark_as_read(gmail, message_id):
     """Remove the UNREAD label from a message."""
-    gmail.users().messages().modify(
+    _with_retry(lambda: gmail.users().messages().modify(
         userId="me",
         id=message_id,
         body={"removeLabelIds": ["UNREAD"]},
-    ).execute()
+    ).execute())
 
 
 def parse_email_date(msg):
