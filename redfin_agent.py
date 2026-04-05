@@ -75,6 +75,7 @@ COLUMNS = [
     "URL",
     "Price History",   # col U — pipe-separated "YYYY-MM-DD:price" entries
     "Schools Updated", # col V — date school data was last fetched
+    "HOA",             # col W — monthly HOA fee if present (condos/HOA communities)
 ]
 
 # ─── AUTH ────────────────────────────────────────────────────────────────────
@@ -303,6 +304,7 @@ def parse_listings_from_html(html, email_date):
             "school3": "", "type3": "", "rating3": "",
             "price_history":   "",
             "schools_updated": "",
+            "hoa":             "",
         })
 
     # Deduplicate within this email by URL
@@ -325,19 +327,21 @@ HEADERS = {
 }
 
 
-def fetch_schools(listing_url):
+def fetch_listing_data(listing_url):
     """
-    Fetch the Redfin listing page and extract up to 3 nearby schools
-    with their name, type, and GreatSchools rating.
-    Returns list of dicts: [{name, type, rating}, ...]
+    Fetch the Redfin listing page and extract:
+    - Up to 3 nearby schools with name, type, and GreatSchools rating
+    - HOA monthly fee if present
+    Returns {"schools": [{name, type, rating}, ...], "hoa": ""}
     """
     try:
         time.sleep(FETCH_DELAY)
         resp = requests.get(listing_url, headers=HEADERS, timeout=15)
         if resp.status_code != 200:
-            return []
+            return {"schools": [], "hoa": ""}
         soup = BeautifulSoup(resp.text, "lxml")
 
+        # ── Schools ──────────────────────────────────────────────────────────
         schools = []
         # School rows are <div class="flex align-center"> containing:
         # "Taft Elementary School Public K-5 • Assigned • 0.4mi 4/10"
@@ -374,10 +378,19 @@ def fetch_schools(listing_url):
             if len(schools) == 3:
                 break
 
-        return schools
+        # ── HOA ──────────────────────────────────────────────────────────────
+        hoa = ""
+        page_text = soup.get_text(" ")
+        hoa_m = re.search(
+            r'HOA\s+(?:Dues?|Fee)?\s*[:\-]?\s*\$\s*([\d,]+)', page_text, re.I
+        )
+        if hoa_m:
+            hoa = "$" + hoa_m.group(1).replace(",", "")
+
+        return {"schools": schools, "hoa": hoa}
     except Exception as e:
-        print(f"    ⚠ Could not fetch schools for {listing_url}: {e}")
-        return []
+        print(f"    ⚠ Could not fetch listing data for {listing_url}: {e}")
+        return {"schools": [], "hoa": ""}
 
 # ─── GOOGLE SHEETS ───────────────────────────────────────────────────────────
 
@@ -404,7 +417,7 @@ def ensure_header(sheets):
     """Write the header row if the sheet is empty."""
     result = _with_retry(lambda: sheets.spreadsheets().values().get(
         spreadsheetId=SHEET_ID,
-        range=f"{SHEET_TAB}!A1:V1",
+        range=f"{SHEET_TAB}!A1:W1",
     ).execute())
     if not result.get("values"):
         _with_retry(lambda: sheets.spreadsheets().values().update(
@@ -423,7 +436,7 @@ def read_sheet(sheets):
     """
     result = _with_retry(lambda: sheets.spreadsheets().values().get(
         spreadsheetId=SHEET_ID,
-        range=f"{SHEET_TAB}!A:V",
+        range=f"{SHEET_TAB}!A:W",
     ).execute())
     rows = result.get("values", [])
     addr_idx = {}
@@ -464,6 +477,7 @@ def listing_to_row(l):
         l["url"],
         l.get("price_history", ""),
         l.get("schools_updated", ""),
+        l.get("hoa", ""),
     ]
 
 
@@ -517,7 +531,7 @@ def write_listings(sheets, listings, rows, addr_idx):
                         l["price_history"] = stored_history
                     row_num = addr_idx[key]
                     update_requests.append({
-                        "range": f"{SHEET_TAB}!A{row_num}:V{row_num}",
+                        "range": f"{SHEET_TAB}!A{row_num}:W{row_num}",
                         "values": [listing_to_row(l)],
                     })
             except ValueError:
@@ -685,7 +699,8 @@ def main():
                         cached_schools.append((name, kind, rating))
                 if cached_schools:
                     schools_updated = row[21] if len(row) > 21 else ""
-                    addr_school_cache[key] = {"schools": cached_schools, "updated": schools_updated}
+                    hoa             = row[22] if len(row) > 22 else ""
+                    addr_school_cache[key] = {"schools": cached_schools, "updated": schools_updated, "hoa": hoa}
 
         # ── Enrich with school data ───────────────────────────────────────────────
         today = datetime.now().strftime("%Y-%m-%d")
@@ -702,6 +717,7 @@ def main():
                     l[f"type{j}"]   = kind
                     l[f"rating{j}"] = rating
                 l["schools_updated"] = cached["updated"]
+                l["hoa"] = cached.get("hoa", "")
             else:
                 to_fetch.append((i, l, cached is not None))
 
@@ -712,23 +728,26 @@ def main():
                   f"(up to {MAX_SCHOOL_WORKERS} parallel)…")
             with ThreadPoolExecutor(max_workers=MAX_SCHOOL_WORKERS) as executor:
                 futures = {
-                    executor.submit(fetch_schools, l["url"]): (i, l, stale)
+                    executor.submit(fetch_listing_data, l["url"]): (i, l, stale)
                     for i, l, stale in to_fetch
                 }
                 for future in as_completed(futures):
                     i, l, stale = futures[future]
-                    schools = future.result()
+                    data = future.result()
+                    schools = data["schools"]
                     for j, s in enumerate(schools[:3], 1):
                         l[f"school{j}"] = s["name"]
                         l[f"type{j}"]   = s["type"]
                         l[f"rating{j}"] = s["rating"]
+                    l["hoa"] = data["hoa"]
                     l["schools_updated"] = today
                     action = "refreshed" if stale else "fetched"
+                    hoa_str = f"  HOA: {data['hoa']}" if data["hoa"] else ""
                     if schools:
                         names = ", ".join(s["name"][:25] for s in schools)
-                        print(f"  🏫 [{i}/{len(deduped)}] {l['address']} → {action}: {names}")
+                        print(f"  🏫 [{i}/{len(deduped)}] {l['address']} → {action}: {names}{hoa_str}")
                     else:
-                        print(f"  🏫 [{i}/{len(deduped)}] {l['address']} → no schools found")
+                        print(f"  🏫 [{i}/{len(deduped)}] {l['address']} → no schools found{hoa_str}")
 
         # ── Write to Sheets ───────────────────────────────────────────────────────
         print(f"\n📝 Writing to Google Sheets…")
