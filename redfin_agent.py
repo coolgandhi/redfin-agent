@@ -15,6 +15,7 @@ import base64
 import os
 import re
 import ssl
+import subprocess
 import time
 import json
 from datetime import datetime, timezone
@@ -645,4 +646,12 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception as e:
+        msg = str(e)[:120].replace('"', "'")
+        subprocess.run([
+            "osascript", "-e",
+            f'display notification "{msg}" with title "Redfin Agent Failed" sound name "Basso"',
+        ])
+        raise
