@@ -558,10 +558,21 @@ RUNS_COLUMNS = [
 
 
 def ensure_runs_header(sheets):
-    result = _with_retry(lambda: sheets.spreadsheets().values().get(
-        spreadsheetId=SHEET_ID,
-        range=f"{RUNS_TAB}!A1:I1",
-    ).execute())
+    try:
+        result = _with_retry(lambda: sheets.spreadsheets().values().get(
+            spreadsheetId=SHEET_ID,
+            range=f"{RUNS_TAB}!A1:I1",
+        ).execute())
+    except HttpError as e:
+        if e.resp.status == 400:
+            # Tab doesn't exist yet — create it first
+            _with_retry(lambda: sheets.spreadsheets().batchUpdate(
+                spreadsheetId=SHEET_ID,
+                body={"requests": [{"addSheet": {"properties": {"title": RUNS_TAB}}}]},
+            ).execute())
+            result = {}
+        else:
+            raise
     if not result.get("values"):
         _with_retry(lambda: sheets.spreadsheets().values().update(
             spreadsheetId=SHEET_ID,
