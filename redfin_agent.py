@@ -57,6 +57,9 @@ FIRST_RUN_LIMIT = 10
 # Polite delay between Redfin page fetches (seconds)
 FETCH_DELAY = 1.5
 
+# Re-fetch school data if it was last updated more than this many days ago
+SCHOOL_REFRESH_DAYS = 90
+
 # Column order written to the sheet
 COLUMNS = [
     "Date", "Address", "City", "Zip", "Status",
@@ -65,6 +68,8 @@ COLUMNS = [
     "School2", "Type2", "Rating2",
     "School3", "Type3", "Rating3",
     "URL",
+    "Price History",   # col U — pipe-separated "YYYY-MM-DD:price" entries
+    "Schools Updated", # col V — date school data was last fetched
 ]
 
 # ─── AUTH ────────────────────────────────────────────────────────────────────
@@ -291,6 +296,8 @@ def parse_listings_from_html(html, email_date):
             "school1": "", "type1": "", "rating1": "",
             "school2": "", "type2": "", "rating2": "",
             "school3": "", "type3": "", "rating3": "",
+            "price_history":   "",
+            "schools_updated": "",
         })
 
     # Deduplicate within this email by URL
@@ -392,7 +399,7 @@ def ensure_header(sheets):
     """Write the header row if the sheet is empty."""
     result = _with_retry(lambda: sheets.spreadsheets().values().get(
         spreadsheetId=SHEET_ID,
-        range=f"{SHEET_TAB}!A1:T1",
+        range=f"{SHEET_TAB}!A1:V1",
     ).execute())
     if not result.get("values"):
         _with_retry(lambda: sheets.spreadsheets().values().update(
@@ -411,7 +418,7 @@ def read_sheet(sheets):
     """
     result = _with_retry(lambda: sheets.spreadsheets().values().get(
         spreadsheetId=SHEET_ID,
-        range=f"{SHEET_TAB}!A:T",
+        range=f"{SHEET_TAB}!A:V",
     ).execute())
     rows = result.get("values", [])
     addr_idx = {}
@@ -450,7 +457,21 @@ def listing_to_row(l):
         l["school2"], l["type2"], l["rating2"],
         l["school3"], l["type3"], l["rating3"],
         l["url"],
+        l.get("price_history", ""),
+        l.get("schools_updated", ""),
     ]
+
+
+def _schools_stale(date_str):
+    """Return True if school data is missing or older than SCHOOL_REFRESH_DAYS."""
+    if not date_str:
+        return True
+    try:
+        from datetime import timedelta
+        d = datetime.strptime(date_str, "%Y-%m-%d")
+        return (datetime.now() - d).days > SCHOOL_REFRESH_DAYS
+    except ValueError:
+        return True
 
 
 def write_listings(sheets, listings, addr_to_row):
@@ -471,22 +492,30 @@ def write_listings(sheets, listings, addr_to_row):
         if not key:
             continue
 
-        row_data = listing_to_row(l)
-
         if key not in addr_idx:
-            rows_to_append.append(row_data)
+            rows_to_append.append(listing_to_row(l))
         else:
             # Check if new email date is more recent than stored date
             existing_row = rows[addr_idx[key] - 1]
-            stored_date_str = existing_row[0] if existing_row else ""
+            stored_date_str  = existing_row[0]  if len(existing_row) > 0  else ""
+            stored_price     = existing_row[5]  if len(existing_row) > 5  else ""
+            stored_history   = existing_row[20] if len(existing_row) > 20 else ""
             try:
                 stored_date = datetime.strptime(stored_date_str, "%Y-%m-%d")
                 new_date    = datetime.strptime(l["date"], "%Y-%m-%d")
                 if new_date > stored_date:
+                    # Prepend old price to history if the price changed
+                    if stored_price and stored_price != l["price"]:
+                        entry = f"{stored_date_str}:{stored_price}"
+                        l["price_history"] = (
+                            f"{entry} | {stored_history}" if stored_history else entry
+                        )
+                    else:
+                        l["price_history"] = stored_history
                     row_num = addr_idx[key]
                     update_requests.append({
-                        "range": f"{SHEET_TAB}!A{row_num}:T{row_num}",
-                        "values": [row_data],
+                        "range": f"{SHEET_TAB}!A{row_num}:V{row_num}",
+                        "values": [listing_to_row(l)],
                     })
             except ValueError:
                 pass   # Can't parse stored date — skip
@@ -593,26 +622,33 @@ def main():
                 if name:
                     cached_schools.append((name, kind, rating))
             if cached_schools:
-                addr_school_cache[key] = cached_schools
+                schools_updated = row[21] if len(row) > 21 else ""
+                addr_school_cache[key] = {"schools": cached_schools, "updated": schools_updated}
 
     # ── Enrich with school data ───────────────────────────────────────────────
+    today = datetime.now().strftime("%Y-%m-%d")
     for i, l in enumerate(deduped, 1):
         key = normalise_address(l["address"])
         cached = addr_school_cache.get(key)
-        if cached:
-            print(f"  🏫 [{i}/{len(deduped)}] {l['address']} → cached ({len(cached)} school(s))")
-            for j, (name, kind, rating) in enumerate(cached[:3], 1):
+        if cached and not _schools_stale(cached["updated"]):
+            print(f"  🏫 [{i}/{len(deduped)}] {l['address']} → cached ({len(cached['schools'])} school(s))")
+            for j, (name, kind, rating) in enumerate(cached["schools"][:3], 1):
                 l[f"school{j}"] = name
                 l[f"type{j}"]   = kind
                 l[f"rating{j}"] = rating
+            l["schools_updated"] = cached["updated"]
             continue
 
-        print(f"  🏫 Fetching schools for [{i}/{len(deduped)}] {l['address']}")
+        if cached and _schools_stale(cached["updated"]):
+            print(f"  🏫 Refreshing stale schools for [{i}/{len(deduped)}] {l['address']}")
+        else:
+            print(f"  🏫 Fetching schools for [{i}/{len(deduped)}] {l['address']}")
         schools = fetch_schools(l["url"])
         for j, s in enumerate(schools[:3], 1):
             l[f"school{j}"] = s["name"]
             l[f"type{j}"]   = s["type"]
             l[f"rating{j}"] = s["rating"]
+        l["schools_updated"] = today
         if schools:
             names = ", ".join(s["name"][:25] for s in schools)
             print(f"    → {len(schools)} school(s): {names}")
