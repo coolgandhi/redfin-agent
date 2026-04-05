@@ -50,6 +50,7 @@ TOKEN_FILE = os.path.join(_DIR, "token.json")
 # https://docs.google.com/spreadsheets/d/SHEET_ID_HERE/edit
 SHEET_ID = "1rLAIiye9GeJ7EYQs9Xe16k_yOsiiKCZ8PQZjuJW0hH8"
 SHEET_TAB = "Listings"          # Tab name inside the spreadsheet
+RUNS_TAB  = "Runs"              # Tab for run history / observability
 
 # How many emails to process on first run
 FIRST_RUN_LIMIT = 10
@@ -546,128 +547,176 @@ def write_listings(sheets, listings, addr_to_row):
 
     return appended, updated
 
+# ─── RUN LOGGING ─────────────────────────────────────────────────────────────
+
+RUNS_COLUMNS = [
+    "Timestamp", "Mode", "Emails Scanned", "Listings Found",
+    "Unique Addresses", "Rows Added", "Rows Updated", "Status", "Error",
+]
+
+
+def ensure_runs_header(sheets):
+    result = _with_retry(lambda: sheets.spreadsheets().values().get(
+        spreadsheetId=SHEET_ID,
+        range=f"{RUNS_TAB}!A1:I1",
+    ).execute())
+    if not result.get("values"):
+        _with_retry(lambda: sheets.spreadsheets().values().update(
+            spreadsheetId=SHEET_ID,
+            range=f"{RUNS_TAB}!A1",
+            valueInputOption="RAW",
+            body={"values": [RUNS_COLUMNS]},
+        ).execute())
+
+
+def log_run(sheets, run_start, mode, n_emails, n_listings, n_unique,
+            n_added, n_updated, status, error):
+    row = [
+        run_start.strftime("%Y-%m-%d %H:%M:%S"),
+        mode, n_emails, n_listings, n_unique, n_added, n_updated, status, error,
+    ]
+    _with_retry(lambda: sheets.spreadsheets().values().append(
+        spreadsheetId=SHEET_ID,
+        range=f"{RUNS_TAB}!A1",
+        valueInputOption="USER_ENTERED",
+        insertDataOption="INSERT_ROWS",
+        body={"values": [row]},
+    ).execute())
+
+
 # ─── MAIN ────────────────────────────────────────────────────────────────────
 
 def main():
     print("🏠 Redfin Real Estate Agent starting…\n")
+    run_start = datetime.now()
 
     gmail, sheets = get_google_services()
     ensure_header(sheets)
+    ensure_runs_header(sheets)
     existing_rows, addr_to_row = read_sheet(sheets)
     latest_date = get_latest_date(existing_rows)
 
-    # ── Determine scan mode ──────────────────────────────────────────────────
-    if latest_date is None:
-        mode = "first_run"
-        print(f"📋 Mode: FIRST RUN — fetching {FIRST_RUN_LIMIT} most recent Redfin emails")
-        query    = "from:redfin.com"
-        messages = fetch_emails(gmail, query, max_results=FIRST_RUN_LIMIT)
-    else:
-        mode = "periodic"
-        after_str = latest_date.strftime("%Y/%m/%d")
-        print(f"📋 Mode: PERIODIC RUN — fetching unread Redfin emails after {after_str}")
-        query    = f"from:redfin.com is:unread after:{after_str}"
-        messages = fetch_emails(gmail, query)
-
-    print(f"📧 Found {len(messages)} email(s) to process\n")
-
+    # Tracking vars — set to defaults so finally block always has values
+    mode        = "unknown"
+    messages    = []
     all_listings = []
+    deduped     = []
+    appended = updated = 0
+    error_msg   = ""
 
-    # ── Extract listings from each email ────────────────────────────────────
-    for idx, msg in enumerate(messages, 1):
-        subject = next(
-            (h["value"] for h in msg["payload"]["headers"] if h["name"] == "Subject"),
-            "(no subject)"
-        )
-        email_date = parse_email_date(msg)
-        print(f"  [{idx}/{len(messages)}] {email_date.date()} — {subject[:70]}")
-
-        html = get_html_body(msg["payload"])
-        if not html:
-            print("    ⚠ No HTML body found, skipping")
-            continue
-
-        listings = parse_listings_from_html(html, email_date)
-        print(f"    → {len(listings)} listing(s) extracted")
-        all_listings.extend(listings)
-
-    # ── Deduplicate across emails (keep most recent per address) ─────────────
-    addr_best = {}
-    for l in all_listings:
-        key = normalise_address(l["address"])
-        if not key:
-            continue
-        if key not in addr_best:
-            addr_best[key] = l
+    try:
+        # ── Determine scan mode ──────────────────────────────────────────────────
+        if latest_date is None:
+            mode = "first_run"
+            print(f"📋 Mode: FIRST RUN — fetching {FIRST_RUN_LIMIT} most recent Redfin emails")
+            query    = "from:redfin.com"
+            messages = fetch_emails(gmail, query, max_results=FIRST_RUN_LIMIT)
         else:
-            existing_d = datetime.strptime(addr_best[key]["date"], "%Y-%m-%d")
-            new_d      = datetime.strptime(l["date"], "%Y-%m-%d")
-            if new_d > existing_d:
+            mode = "periodic"
+            after_str = latest_date.strftime("%Y/%m/%d")
+            print(f"📋 Mode: PERIODIC RUN — fetching unread Redfin emails after {after_str}")
+            query    = f"from:redfin.com is:unread after:{after_str}"
+            messages = fetch_emails(gmail, query)
+
+        print(f"📧 Found {len(messages)} email(s) to process\n")
+
+        all_listings = []
+
+        # ── Extract listings from each email ────────────────────────────────────
+        for idx, msg in enumerate(messages, 1):
+            subject = next(
+                (h["value"] for h in msg["payload"]["headers"] if h["name"] == "Subject"),
+                "(no subject)"
+            )
+            email_date = parse_email_date(msg)
+            print(f"  [{idx}/{len(messages)}] {email_date.date()} — {subject[:70]}")
+
+            html = get_html_body(msg["payload"])
+            if not html:
+                print("    ⚠ No HTML body found, skipping")
+                continue
+
+            listings = parse_listings_from_html(html, email_date)
+            print(f"    → {len(listings)} listing(s) extracted")
+            all_listings.extend(listings)
+
+        # ── Deduplicate across emails (keep most recent per address) ─────────────
+        addr_best = {}
+        for l in all_listings:
+            key = normalise_address(l["address"])
+            if not key:
+                continue
+            if key not in addr_best:
                 addr_best[key] = l
+            else:
+                existing_d = datetime.strptime(addr_best[key]["date"], "%Y-%m-%d")
+                new_d      = datetime.strptime(l["date"], "%Y-%m-%d")
+                if new_d > existing_d:
+                    addr_best[key] = l
 
-    deduped = list(addr_best.values())
-    print(f"\n📊 {len(all_listings)} total listings → {len(deduped)} unique addresses\n")
+        deduped = list(addr_best.values())
+        print(f"\n📊 {len(all_listings)} total listings → {len(deduped)} unique addresses\n")
 
-    # ── Build school cache from existing sheet rows ───────────────────────────
-    addr_school_cache = {}
-    for row in existing_rows[1:]:
-        if len(row) > 1 and row[1]:
-            key = normalise_address(row[1])
-            cached_schools = []
-            for j in range(3):
-                base = 10 + j * 3
-                name   = row[base]     if len(row) > base     else ""
-                kind   = row[base + 1] if len(row) > base + 1 else ""
-                rating = row[base + 2] if len(row) > base + 2 else ""
-                if name:
-                    cached_schools.append((name, kind, rating))
-            if cached_schools:
-                schools_updated = row[21] if len(row) > 21 else ""
-                addr_school_cache[key] = {"schools": cached_schools, "updated": schools_updated}
+        # ── Build school cache from existing sheet rows ───────────────────────────
+        addr_school_cache = {}
+        for row in existing_rows[1:]:
+            if len(row) > 1 and row[1]:
+                key = normalise_address(row[1])
+                cached_schools = []
+                for j in range(3):
+                    base = 10 + j * 3
+                    name   = row[base]     if len(row) > base     else ""
+                    kind   = row[base + 1] if len(row) > base + 1 else ""
+                    rating = row[base + 2] if len(row) > base + 2 else ""
+                    if name:
+                        cached_schools.append((name, kind, rating))
+                if cached_schools:
+                    schools_updated = row[21] if len(row) > 21 else ""
+                    addr_school_cache[key] = {"schools": cached_schools, "updated": schools_updated}
 
-    # ── Enrich with school data ───────────────────────────────────────────────
-    today = datetime.now().strftime("%Y-%m-%d")
-    for i, l in enumerate(deduped, 1):
-        key = normalise_address(l["address"])
-        cached = addr_school_cache.get(key)
-        if cached and not _schools_stale(cached["updated"]):
-            print(f"  🏫 [{i}/{len(deduped)}] {l['address']} → cached ({len(cached['schools'])} school(s))")
-            for j, (name, kind, rating) in enumerate(cached["schools"][:3], 1):
-                l[f"school{j}"] = name
-                l[f"type{j}"]   = kind
-                l[f"rating{j}"] = rating
-            l["schools_updated"] = cached["updated"]
-            continue
+        # ── Enrich with school data ───────────────────────────────────────────────
+        today = datetime.now().strftime("%Y-%m-%d")
+        for i, l in enumerate(deduped, 1):
+            key = normalise_address(l["address"])
+            cached = addr_school_cache.get(key)
+            if cached and not _schools_stale(cached["updated"]):
+                print(f"  🏫 [{i}/{len(deduped)}] {l['address']} → cached ({len(cached['schools'])} school(s))")
+                for j, (name, kind, rating) in enumerate(cached["schools"][:3], 1):
+                    l[f"school{j}"] = name
+                    l[f"type{j}"]   = kind
+                    l[f"rating{j}"] = rating
+                l["schools_updated"] = cached["updated"]
+                continue
 
-        if cached and _schools_stale(cached["updated"]):
-            print(f"  🏫 Refreshing stale schools for [{i}/{len(deduped)}] {l['address']}")
-        else:
-            print(f"  🏫 Fetching schools for [{i}/{len(deduped)}] {l['address']}")
-        schools = fetch_schools(l["url"])
-        for j, s in enumerate(schools[:3], 1):
-            l[f"school{j}"] = s["name"]
-            l[f"type{j}"]   = s["type"]
-            l[f"rating{j}"] = s["rating"]
-        l["schools_updated"] = today
-        if schools:
-            names = ", ".join(s["name"][:25] for s in schools)
-            print(f"    → {len(schools)} school(s): {names}")
-        else:
-            print("    → no schools found")
+            if cached and _schools_stale(cached["updated"]):
+                print(f"  🏫 Refreshing stale schools for [{i}/{len(deduped)}] {l['address']}")
+            else:
+                print(f"  🏫 Fetching schools for [{i}/{len(deduped)}] {l['address']}")
+            schools = fetch_schools(l["url"])
+            for j, s in enumerate(schools[:3], 1):
+                l[f"school{j}"] = s["name"]
+                l[f"type{j}"]   = s["type"]
+                l[f"rating{j}"] = s["rating"]
+            l["schools_updated"] = today
+            if schools:
+                names = ", ".join(s["name"][:25] for s in schools)
+                print(f"    → {len(schools)} school(s): {names}")
+            else:
+                print("    → no schools found")
 
-    # ── Write to Sheets ───────────────────────────────────────────────────────
-    print(f"\n📝 Writing to Google Sheets…")
-    appended, updated = write_listings(sheets, deduped, addr_to_row)
-    print(f"   ✅ {appended} new row(s) added, {updated} row(s) updated")
+        # ── Write to Sheets ───────────────────────────────────────────────────────
+        print(f"\n📝 Writing to Google Sheets…")
+        appended, updated = write_listings(sheets, deduped, addr_to_row)
+        print(f"   ✅ {appended} new row(s) added, {updated} row(s) updated")
 
-    # ── Mark emails as read ───────────────────────────────────────────────────
-    if mode == "periodic":
-        print(f"\n✉️  Marking {len(messages)} email(s) as read…")
-        for msg in messages:
-            mark_as_read(gmail, msg["id"])
+        # ── Mark emails as read ───────────────────────────────────────────────────
+        if mode == "periodic":
+            print(f"\n✉️  Marking {len(messages)} email(s) as read…")
+            for msg in messages:
+                mark_as_read(gmail, msg["id"])
 
-    # ── Summary ───────────────────────────────────────────────────────────────
-    print(f"""
+        # ── Summary ───────────────────────────────────────────────────────────────
+        print(f"""
 ╔══════════════════════════════════════╗
 ║           Run complete               ║
 ╠══════════════════════════════════════╣
@@ -679,6 +728,14 @@ def main():
 ║  Rows updated  : {updated:<20} ║
 ╚══════════════════════════════════════╝
 """)
+
+    except Exception as e:
+        error_msg = str(e)[:500]
+        raise
+    finally:
+        status = "Failed" if error_msg else "Success"
+        log_run(sheets, run_start, mode, len(messages), len(all_listings),
+                len(deduped), appended, updated, status, error_msg)
 
 
 if __name__ == "__main__":
