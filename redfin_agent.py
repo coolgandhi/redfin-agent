@@ -18,6 +18,7 @@ import ssl
 import subprocess
 import time
 import json
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from email import message_from_bytes
 from html.parser import HTMLParser
@@ -60,6 +61,9 @@ FETCH_DELAY = 1.5
 
 # Re-fetch school data if it was last updated more than this many days ago
 SCHOOL_REFRESH_DAYS = 90
+
+# Number of parallel workers for school page fetches
+MAX_SCHOOL_WORKERS = 5
 
 # Column order written to the sheet
 COLUMNS = [
@@ -475,15 +479,13 @@ def _schools_stale(date_str):
         return True
 
 
-def write_listings(sheets, listings, addr_to_row):
+def write_listings(sheets, listings, rows, addr_idx):
     """
     For each listing:
       - If address not in sheet → batch append.
       - If address exists and new date > stored date → overwrite that row.
     Returns (appended_count, updated_count).
     """
-    # Re-read sheet to get latest state before writing
-    rows, addr_idx = read_sheet(sheets)
 
     rows_to_append = []
     update_requests = []
@@ -676,6 +678,9 @@ def main():
 
         # ── Enrich with school data ───────────────────────────────────────────────
         today = datetime.now().strftime("%Y-%m-%d")
+
+        # Apply cache for listings whose school data is still fresh
+        to_fetch = []  # (index, listing, is_stale_refresh)
         for i, l in enumerate(deduped, 1):
             key = normalise_address(l["address"])
             cached = addr_school_cache.get(key)
@@ -686,27 +691,37 @@ def main():
                     l[f"type{j}"]   = kind
                     l[f"rating{j}"] = rating
                 l["schools_updated"] = cached["updated"]
-                continue
+            else:
+                to_fetch.append((i, l, cached is not None))
 
-            if cached and _schools_stale(cached["updated"]):
-                print(f"  🏫 Refreshing stale schools for [{i}/{len(deduped)}] {l['address']}")
-            else:
-                print(f"  🏫 Fetching schools for [{i}/{len(deduped)}] {l['address']}")
-            schools = fetch_schools(l["url"])
-            for j, s in enumerate(schools[:3], 1):
-                l[f"school{j}"] = s["name"]
-                l[f"type{j}"]   = s["type"]
-                l[f"rating{j}"] = s["rating"]
-            l["schools_updated"] = today
-            if schools:
-                names = ", ".join(s["name"][:25] for s in schools)
-                print(f"    → {len(schools)} school(s): {names}")
-            else:
-                print("    → no schools found")
+        # Fetch school data in parallel for listings that need it
+        if to_fetch:
+            label = "stale refresh" if all(stale for _, _, stale in to_fetch) else "fetch"
+            print(f"\n  🏫 Fetching schools for {len(to_fetch)} listing(s) "
+                  f"(up to {MAX_SCHOOL_WORKERS} parallel)…")
+            with ThreadPoolExecutor(max_workers=MAX_SCHOOL_WORKERS) as executor:
+                futures = {
+                    executor.submit(fetch_schools, l["url"]): (i, l, stale)
+                    for i, l, stale in to_fetch
+                }
+                for future in as_completed(futures):
+                    i, l, stale = futures[future]
+                    schools = future.result()
+                    for j, s in enumerate(schools[:3], 1):
+                        l[f"school{j}"] = s["name"]
+                        l[f"type{j}"]   = s["type"]
+                        l[f"rating{j}"] = s["rating"]
+                    l["schools_updated"] = today
+                    action = "refreshed" if stale else "fetched"
+                    if schools:
+                        names = ", ".join(s["name"][:25] for s in schools)
+                        print(f"  🏫 [{i}/{len(deduped)}] {l['address']} → {action}: {names}")
+                    else:
+                        print(f"  🏫 [{i}/{len(deduped)}] {l['address']} → no schools found")
 
         # ── Write to Sheets ───────────────────────────────────────────────────────
         print(f"\n📝 Writing to Google Sheets…")
-        appended, updated = write_listings(sheets, deduped, addr_to_row)
+        appended, updated = write_listings(sheets, deduped, existing_rows, addr_to_row)
         print(f"   ✅ {appended} new row(s) added, {updated} row(s) updated")
 
         # ── Mark emails as read ───────────────────────────────────────────────────
