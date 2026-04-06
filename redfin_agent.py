@@ -76,6 +76,11 @@ COLUMNS = [
     "Price History",   # col U — pipe-separated "YYYY-MM-DD:price" entries
     "Schools Updated", # col V — date school data was last fetched
     "HOA",             # col W — monthly HOA fee if present (condos/HOA communities)
+    "First Seen",      # col X — date listing was first added to sheet
+    "Days on Market",  # col Y — days since First Seen (recomputed each run)
+    "Price Drops",     # col Z — number of price reductions
+    "Total Drop $",    # col AA — original price minus current price
+    "HOA-Adj Price",   # col AB — price + HOA/mo * 12 * 25 (normalized cost)
 ]
 
 # ─── AUTH ────────────────────────────────────────────────────────────────────
@@ -305,6 +310,11 @@ def parse_listings_from_html(html, email_date):
             "price_history":   "",
             "schools_updated": "",
             "hoa":             "",
+            "first_seen":      "",
+            "days_on_market":  "",
+            "price_drops":     "",
+            "total_drop":      "",
+            "hoa_adj_price":   "",
         })
 
     # Deduplicate within this email by URL
@@ -417,7 +427,7 @@ def ensure_header(sheets):
     """Write the header row if the sheet is empty."""
     result = _with_retry(lambda: sheets.spreadsheets().values().get(
         spreadsheetId=SHEET_ID,
-        range=f"{SHEET_TAB}!A1:W1",
+        range=f"{SHEET_TAB}!A1:AB1",
     ).execute())
     if not result.get("values"):
         _with_retry(lambda: sheets.spreadsheets().values().update(
@@ -436,7 +446,7 @@ def read_sheet(sheets):
     """
     result = _with_retry(lambda: sheets.spreadsheets().values().get(
         spreadsheetId=SHEET_ID,
-        range=f"{SHEET_TAB}!A:W",
+        range=f"{SHEET_TAB}!A:AB",
     ).execute())
     rows = result.get("values", [])
     addr_idx = {}
@@ -478,6 +488,11 @@ def listing_to_row(l):
         l.get("price_history", ""),
         l.get("schools_updated", ""),
         l.get("hoa", ""),
+        l.get("first_seen", ""),
+        l.get("days_on_market", ""),
+        l.get("price_drops", ""),
+        l.get("total_drop", ""),
+        l.get("hoa_adj_price", ""),
     ]
 
 
@@ -491,6 +506,47 @@ def _schools_stale(date_str):
         return (datetime.now() - d).days > SCHOOL_REFRESH_DAYS
     except ValueError:
         return True
+
+
+def _compute_dom(first_seen_str):
+    """Days between first_seen and today."""
+    if not first_seen_str:
+        return ""
+    try:
+        return str((datetime.now() - datetime.strptime(first_seen_str, "%Y-%m-%d")).days)
+    except ValueError:
+        return ""
+
+
+def _compute_price_stats(current_price_str, price_history_str):
+    """Return (num_drops, total_drop) from price history.
+    price_history entries are newest-first: "DATE:PRICE | DATE:PRICE"
+    """
+    if not current_price_str:
+        return "0", "0"
+    try:
+        current = int(current_price_str)
+        if not price_history_str:
+            return "0", "0"
+        entries = [e.strip() for e in price_history_str.split("|") if e.strip()]
+        # Build chronological price list: oldest → newest → current
+        past_prices = [int(e.split(":")[-1].strip()) for e in reversed(entries)]
+        chrono = past_prices + [current]
+        drops = sum(1 for i in range(1, len(chrono)) if chrono[i] < chrono[i - 1])
+        total_drop = chrono[0] - current   # positive = price reduced overall
+        return str(drops), str(total_drop) if total_drop > 0 else "0"
+    except (ValueError, IndexError):
+        return "0", "0"
+
+
+def _hoa_adj(price_str, hoa_str):
+    """Capitalise HOA cost into purchase price equivalent (HOA/mo × 12 × 25)."""
+    try:
+        price = int(price_str) if price_str else 0
+        hoa_num = int(re.sub(r"[^\d]", "", hoa_str)) if hoa_str else 0
+        return str(price + hoa_num * 12 * 25) if price else ""
+    except (ValueError, AttributeError):
+        return ""
 
 
 def write_listings(sheets, listings, rows, addr_idx):
@@ -510,13 +566,19 @@ def write_listings(sheets, listings, rows, addr_idx):
             continue
 
         if key not in addr_idx:
+            l["first_seen"]     = l["date"]
+            l["days_on_market"] = _compute_dom(l["date"])
+            l["price_drops"]    = "0"
+            l["total_drop"]     = "0"
+            l["hoa_adj_price"]  = _hoa_adj(l["price"], l["hoa"])
             rows_to_append.append(listing_to_row(l))
         else:
             # Check if new email date is more recent than stored date
-            existing_row = rows[addr_idx[key] - 1]
+            existing_row     = rows[addr_idx[key] - 1]
             stored_date_str  = existing_row[0]  if len(existing_row) > 0  else ""
             stored_price     = existing_row[5]  if len(existing_row) > 5  else ""
             stored_history   = existing_row[20] if len(existing_row) > 20 else ""
+            stored_first_seen = existing_row[23] if len(existing_row) > 23 else ""
             try:
                 stored_date = datetime.strptime(stored_date_str, "%Y-%m-%d")
                 new_date    = datetime.strptime(l["date"], "%Y-%m-%d")
@@ -529,9 +591,16 @@ def write_listings(sheets, listings, rows, addr_idx):
                         )
                     else:
                         l["price_history"] = stored_history
+                    # Preserve first seen; recompute derived fields
+                    l["first_seen"]     = stored_first_seen or stored_date_str
+                    l["days_on_market"] = _compute_dom(l["first_seen"])
+                    l["price_drops"], l["total_drop"] = _compute_price_stats(
+                        l["price"], l["price_history"]
+                    )
+                    l["hoa_adj_price"]  = _hoa_adj(l["price"], l["hoa"])
                     row_num = addr_idx[key]
                     update_requests.append({
-                        "range": f"{SHEET_TAB}!A{row_num}:W{row_num}",
+                        "range": f"{SHEET_TAB}!A{row_num}:AB{row_num}",
                         "values": [listing_to_row(l)],
                     })
             except ValueError:
