@@ -16,6 +16,7 @@ import os
 import re
 import ssl
 import subprocess
+import sys
 import time
 import json
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -41,6 +42,13 @@ SCOPES = [
 
 # Resolve paths relative to this script so cron can run it from any directory
 _DIR = os.path.dirname(os.path.abspath(__file__))
+
+# When launched by launchd (no TTY), redirect stdout/stderr to the log file
+# so macOS sandbox restrictions on StandardOutPath don't prevent the job from running.
+if not sys.stdout.isatty():
+    _log_fh = open(os.path.join(_DIR, "agent.log"), "a", buffering=1)
+    sys.stdout = _log_fh
+    sys.stderr = _log_fh
 
 # Path to your OAuth credentials file downloaded from Google Cloud Console
 CREDENTIALS_FILE = os.path.join(_DIR, "credentials.json")
