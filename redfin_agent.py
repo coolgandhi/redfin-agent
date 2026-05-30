@@ -19,6 +19,7 @@ import subprocess
 import sys
 import time
 import json
+import sqlite3
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from email import message_from_bytes
@@ -45,8 +46,16 @@ _DIR = os.path.dirname(os.path.abspath(__file__))
 
 # When launched by launchd (no TTY), redirect stdout/stderr to the log file
 # so macOS sandbox restrictions on StandardOutPath don't prevent the job from running.
+_LOG_FILE = os.path.join(_DIR, "agent.log")
 if not sys.stdout.isatty():
-    _log_fh = open(os.path.join(_DIR, "agent.log"), "a", buffering=1)
+    # Skip if already ran today — launchd fires multiple retry windows to handle
+    # missed triggers (e.g. machine asleep at scheduled time), so guard against
+    # double-runs when the machine was awake for all windows.
+    if os.path.exists(_LOG_FILE):
+        _log_mtime = datetime.fromtimestamp(os.path.getmtime(_LOG_FILE)).strftime("%Y-%m-%d")
+        if _log_mtime == datetime.now().strftime("%Y-%m-%d"):
+            sys.exit(0)
+    _log_fh = open(_LOG_FILE, "a", buffering=1)
     sys.stdout = _log_fh
     sys.stderr = _log_fh
 
@@ -60,6 +69,9 @@ TOKEN_FILE = os.path.join(_DIR, "token.json")
 SHEET_ID = "1rLAIiye9GeJ7EYQs9Xe16k_yOsiiKCZ8PQZjuJW0hH8"
 SHEET_TAB = "Listings"          # Tab name inside the spreadsheet
 RUNS_TAB  = "Runs"              # Tab for run history / observability
+
+# Local SQLite database written by the agent and read by the Streamlit app
+DB_FILE = os.path.join(_DIR, "listings.db")
 
 # How many emails to process on first run
 FIRST_RUN_LIMIT = 10
@@ -89,6 +101,7 @@ COLUMNS = [
     "Price Drops",     # col Z — number of price reductions
     "Total Drop $",    # col AA — original price minus current price
     "HOA-Adj Price",   # col AB — price + HOA/mo * 12 * 25 (normalized cost)
+    "Property Type",   # col AC — e.g. Single Family, Condo, Townhouse
 ]
 
 # ─── AUTH ────────────────────────────────────────────────────────────────────
@@ -323,6 +336,7 @@ def parse_listings_from_html(html, email_date):
             "price_drops":     "",
             "total_drop":      "",
             "hoa_adj_price":   "",
+            "property_type":   "",
         })
 
     # Deduplicate within this email by URL
@@ -350,7 +364,8 @@ def fetch_listing_data(listing_url):
     Fetch the Redfin listing page and extract:
     - Up to 3 nearby schools with name, type, and GreatSchools rating
     - HOA monthly fee if present
-    Returns {"schools": [{name, type, rating}, ...], "hoa": ""}
+    - Property type (Single Family, Condo, Townhouse, etc.)
+    Returns {"schools": [{name, type, rating}, ...], "hoa": "", "property_type": ""}
     """
     try:
         time.sleep(FETCH_DELAY)
@@ -405,10 +420,22 @@ def fetch_listing_data(listing_url):
         if hoa_m:
             hoa = "$" + hoa_m.group(1).replace(",", "")
 
-        return {"schools": schools, "hoa": hoa}
+        # ── Property Type ─────────────────────────────────────────────────────
+        # Redfin pages render the value before the label: "Condo Property Type"
+        prop_type = ""
+        prop_m = re.search(
+            r'(Single[- ]Family(?:\s+Residential)?|Condo(?:/Co-op)?|Townhome|Townhouse|'
+            r'Multi[- ]Family[^\n\r]{0,20}|Manufactured(?:\s+Home)?|Mobile(?:\s+Home)?|'
+            r'Co-op|Land)\s+Property\s+Type\b',
+            page_text, re.I
+        )
+        if prop_m:
+            prop_type = prop_m.group(1).strip().title()
+
+        return {"schools": schools, "hoa": hoa, "property_type": prop_type}
     except Exception as e:
         print(f"    ⚠ Could not fetch listing data for {listing_url}: {e}")
-        return {"schools": [], "hoa": ""}
+        return {"schools": [], "hoa": "", "property_type": ""}
 
 # ─── GOOGLE SHEETS ───────────────────────────────────────────────────────────
 
@@ -435,7 +462,7 @@ def ensure_header(sheets):
     """Write the header row if the sheet is empty."""
     result = _with_retry(lambda: sheets.spreadsheets().values().get(
         spreadsheetId=SHEET_ID,
-        range=f"{SHEET_TAB}!A1:AB1",
+        range=f"{SHEET_TAB}!A1:AC1",
     ).execute())
     if not result.get("values"):
         _with_retry(lambda: sheets.spreadsheets().values().update(
@@ -454,7 +481,7 @@ def read_sheet(sheets):
     """
     result = _with_retry(lambda: sheets.spreadsheets().values().get(
         spreadsheetId=SHEET_ID,
-        range=f"{SHEET_TAB}!A:AB",
+        range=f"{SHEET_TAB}!A:AC",
     ).execute())
     rows = result.get("values", [])
     addr_idx = {}
@@ -501,6 +528,7 @@ def listing_to_row(l):
         l.get("price_drops", ""),
         l.get("total_drop", ""),
         l.get("hoa_adj_price", ""),
+        l.get("property_type", ""),
     ]
 
 
@@ -509,7 +537,6 @@ def _schools_stale(date_str):
     if not date_str:
         return True
     try:
-        from datetime import timedelta
         d = datetime.strptime(date_str, "%Y-%m-%d")
         return (datetime.now() - d).days > SCHOOL_REFRESH_DAYS
     except ValueError:
@@ -608,7 +635,7 @@ def write_listings(sheets, listings, rows, addr_idx):
                     l["hoa_adj_price"]  = _hoa_adj(l["price"], l["hoa"])
                     row_num = addr_idx[key]
                     update_requests.append({
-                        "range": f"{SHEET_TAB}!A{row_num}:AB{row_num}",
+                        "range": f"{SHEET_TAB}!A{row_num}:AC{row_num}",
                         "values": [listing_to_row(l)],
                     })
             except ValueError:
@@ -639,6 +666,151 @@ def write_listings(sheets, listings, rows, addr_idx):
         updated = len(update_requests)
 
     return appended, updated
+
+# ─── SQLITE ──────────────────────────────────────────────────────────────────
+
+def _sheet_rows_to_listings(rows):
+    """Convert raw sheet rows (list of lists, header at index 0) to listing dicts."""
+    if len(rows) < 2:
+        return []
+    header = rows[0]
+    col = {name: i for i, name in enumerate(header)}
+
+    def get(row, key):
+        i = col.get(key)
+        return row[i] if i is not None and i < len(row) else ""
+
+    listings = []
+    for row in rows[1:]:
+        if not row or not row[1]:   # skip empty / no address
+            continue
+        listings.append({
+            "date":          get(row, "Date"),
+            "address":       get(row, "Address"),
+            "city":          get(row, "City"),
+            "zip":           get(row, "Zip"),
+            "status":        get(row, "Status"),
+            "price":         get(row, "Price"),
+            "beds":          get(row, "Beds"),
+            "baths":         get(row, "Baths"),
+            "sqft":          get(row, "SqFt"),
+            "price_psf":     get(row, "Price/SqFt"),
+            "school1":       get(row, "School1"),
+            "type1":         get(row, "Type1"),
+            "rating1":       get(row, "Rating1"),
+            "school2":       get(row, "School2"),
+            "type2":         get(row, "Type2"),
+            "rating2":       get(row, "Rating2"),
+            "school3":       get(row, "School3"),
+            "type3":         get(row, "Type3"),
+            "rating3":       get(row, "Rating3"),
+            "url":           get(row, "URL"),
+            "price_history": get(row, "Price History"),
+            "schools_updated": get(row, "Schools Updated"),
+            "hoa":           get(row, "HOA"),
+            "first_seen":    get(row, "First Seen"),
+            "days_on_market": get(row, "Days on Market"),
+            "price_drops":   get(row, "Price Drops"),
+            "total_drop":    get(row, "Total Drop $"),
+            "hoa_adj_price": get(row, "HOA-Adj Price"),
+            "property_type": get(row, "Property Type"),
+        })
+    return listings
+
+
+def upsert_sqlite(listings):
+    """Upsert enriched listings into the local SQLite database."""
+    conn = sqlite3.connect(DB_FILE)
+    cur = conn.cursor()
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS listings (
+            address      TEXT PRIMARY KEY,
+            date         TEXT, city TEXT, zip TEXT, status TEXT,
+            price        TEXT, beds TEXT, baths TEXT, sqft TEXT, price_psf TEXT,
+            school1      TEXT, type1 TEXT, rating1 TEXT,
+            school2      TEXT, type2 TEXT, rating2 TEXT,
+            school3      TEXT, type3 TEXT, rating3 TEXT,
+            url          TEXT, price_history TEXT, schools_updated TEXT,
+            hoa          TEXT, first_seen TEXT, days_on_market TEXT,
+            price_drops  TEXT, total_drop TEXT, hoa_adj_price TEXT,
+            property_type TEXT
+        )
+    """)
+    # Add property_type column if it doesn't exist yet (migration for existing DBs)
+    try:
+        cur.execute("ALTER TABLE listings ADD COLUMN property_type TEXT DEFAULT ''")
+    except Exception:
+        pass  # Column already exists
+    for l in listings:
+        cur.execute("""
+            INSERT OR REPLACE INTO listings VALUES
+            (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+        """, (
+            normalise_address(l["address"]),
+            l["date"], l["city"], l["zip"], l["status"],
+            l["price"], l["beds"], l["baths"], l["sqft"], l["price_psf"],
+            l["school1"], l["type1"], l["rating1"],
+            l["school2"], l["type2"], l["rating2"],
+            l["school3"], l["type3"], l["rating3"],
+            l["url"],
+            l.get("price_history", ""), l.get("schools_updated", ""),
+            l.get("hoa", ""), l.get("first_seen", ""), l.get("days_on_market", ""),
+            l.get("price_drops", ""), l.get("total_drop", ""), l.get("hoa_adj_price", ""),
+            l.get("property_type", ""),
+        ))
+    conn.commit()
+    conn.close()
+    print(f"   🗄️  SQLite updated ({len(listings)} listing(s) upserted → {DB_FILE})")
+
+
+# ─── BACKFILL ────────────────────────────────────────────────────────────────
+
+def backfill_property_type():
+    """
+    Fetch property type for all SQLite listings that don't have it yet.
+    Updates SQLite in-place. Run with: python3 redfin_agent.py --backfill-property-type
+    """
+    conn = sqlite3.connect(DB_FILE)
+    try:
+        conn.execute("ALTER TABLE listings ADD COLUMN property_type TEXT DEFAULT ''")
+        conn.commit()
+    except Exception:
+        pass  # Column already exists
+    rows = conn.execute(
+        "SELECT address, url FROM listings WHERE property_type IS NULL OR property_type = ''"
+    ).fetchall()
+    conn.close()
+
+    if not rows:
+        print("✅ All listings already have a property type — nothing to backfill.")
+        return
+
+    print(f"🏠 Backfilling property type for {len(rows)} listing(s) "
+          f"(up to {MAX_SCHOOL_WORKERS} parallel)…\n")
+
+    results = []
+    with ThreadPoolExecutor(max_workers=MAX_SCHOOL_WORKERS) as executor:
+        futures = {
+            executor.submit(fetch_listing_data, url): (addr, url)
+            for addr, url in rows
+        }
+        for i, future in enumerate(as_completed(futures), 1):
+            addr, url = futures[future]
+            data = future.result()
+            prop_type = data.get("property_type", "")
+            results.append((prop_type, addr))
+            print(f"  [{i}/{len(rows)}] {addr} → {prop_type or '(not found)'}")
+
+    conn = sqlite3.connect(DB_FILE)
+    conn.executemany(
+        "UPDATE listings SET property_type = ? WHERE address = ?",
+        results,
+    )
+    conn.commit()
+    conn.close()
+    found = sum(1 for pt, _ in results if pt)
+    print(f"\n✅ Backfill complete — {found}/{len(results)} listing(s) got a property type.")
+
 
 # ─── RUN LOGGING ─────────────────────────────────────────────────────────────
 
@@ -699,6 +871,13 @@ def main():
     ensure_runs_header(sheets)
     existing_rows, addr_to_row = read_sheet(sheets)
     latest_date = get_latest_date(existing_rows)
+
+    # One-time SQLite backfill: if DB doesn't exist yet, seed it from the sheet
+    if not os.path.exists(DB_FILE):
+        seed = _sheet_rows_to_listings(existing_rows)
+        if seed:
+            print(f"🗄️  Seeding SQLite from sheet ({len(seed)} existing listing(s))…")
+            upsert_sqlite(seed)
 
     # Tracking vars — set to defaults so finally block always has values
     mode        = "unknown"
@@ -777,7 +956,8 @@ def main():
                 if cached_schools:
                     schools_updated = row[21] if len(row) > 21 else ""
                     hoa             = row[22] if len(row) > 22 else ""
-                    addr_school_cache[key] = {"schools": cached_schools, "updated": schools_updated, "hoa": hoa}
+                    property_type   = row[28] if len(row) > 28 else ""
+                    addr_school_cache[key] = {"schools": cached_schools, "updated": schools_updated, "hoa": hoa, "property_type": property_type}
 
         # ── Enrich with school data ───────────────────────────────────────────────
         today = datetime.now().strftime("%Y-%m-%d")
@@ -795,6 +975,7 @@ def main():
                     l[f"rating{j}"] = rating
                 l["schools_updated"] = cached["updated"]
                 l["hoa"] = cached.get("hoa", "")
+                l["property_type"] = cached.get("property_type", "")
             else:
                 to_fetch.append((i, l, cached is not None))
 
@@ -817,6 +998,7 @@ def main():
                         l[f"type{j}"]   = s["type"]
                         l[f"rating{j}"] = s["rating"]
                     l["hoa"] = data["hoa"]
+                    l["property_type"] = data.get("property_type", "")
                     l["schools_updated"] = today
                     action = "refreshed" if stale else "fetched"
                     hoa_str = f"  HOA: {data['hoa']}" if data["hoa"] else ""
@@ -830,6 +1012,10 @@ def main():
         print(f"\n📝 Writing to Google Sheets…")
         appended, updated = write_listings(sheets, deduped, existing_rows, addr_to_row)
         print(f"   ✅ {appended} new row(s) added, {updated} row(s) updated")
+
+        # ── Write to SQLite ───────────────────────────────────────────────────────
+        if deduped:
+            upsert_sqlite(deduped)
 
         # ── Mark emails as read ───────────────────────────────────────────────────
         if mode == "periodic":
@@ -861,12 +1047,15 @@ def main():
 
 
 if __name__ == "__main__":
-    try:
-        main()
-    except Exception as e:
-        msg = str(e)[:120].replace('"', "'")
-        subprocess.run([
-            "osascript", "-e",
-            f'display notification "{msg}" with title "Redfin Agent Failed" sound name "Basso"',
-        ])
-        raise
+    if "--backfill-property-type" in sys.argv:
+        backfill_property_type()
+    else:
+        try:
+            main()
+        except Exception as e:
+            msg = str(e)[:120].replace('"', "'")
+            subprocess.run([
+                "osascript", "-e",
+                f'display notification "{msg}" with title "Redfin Agent Failed" sound name "Basso"',
+            ])
+            raise
