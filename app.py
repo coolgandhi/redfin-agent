@@ -207,19 +207,28 @@ with tab_trends:
 
         with col_l:
             st.subheader("Price / SqFt Over Time")
+            _psf_valid = dfv.dropna(subset=["price", "sqft"])
             psf_trend = (
                 dfv.dropna(subset=["price_psf"])
                 .groupby("period")
                 .agg(avg_psf=("price_psf", "mean"), median_psf=("price_psf", "median"))
                 .reset_index().sort_values("period")
             )
+            wtd_trend = (
+                _psf_valid.groupby("period")
+                .agg(_p=("price", "sum"), _s=("sqft", "sum"))
+                .assign(wtd_psf=lambda d: d["_p"] / d["_s"])
+                .drop(columns=["_p", "_s"])
+                .reset_index()
+            )
+            psf_trend = psf_trend.merge(wtd_trend, on="period", how="left")
             fig1 = px.line(
-                psf_trend, x="period", y=["avg_psf", "median_psf"],
+                psf_trend, x="period", y=["avg_psf", "median_psf", "wtd_psf"],
                 labels={"value": "$/SqFt", "period": gran, "variable": ""},
-                color_discrete_map={"avg_psf": "#636EFA", "median_psf": "#EF553B"},
+                color_discrete_map={"avg_psf": "#636EFA", "median_psf": "#EF553B", "wtd_psf": "#00CC96"},
             )
             fig1.for_each_trace(lambda t: t.update(
-                name={"avg_psf": "Avg", "median_psf": "Median"}[t.name]
+                name={"avg_psf": "Avg", "median_psf": "Median", "wtd_psf": "Wtd"}[t.name]
             ))
             st.plotly_chart(fig1, use_container_width=True)
 
