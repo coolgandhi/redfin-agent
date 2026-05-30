@@ -168,12 +168,16 @@ if sel_rating > 0:
 
 st.caption(f"Showing **{len(filtered):,}** of {len(df):,} listings")
 
+_psf_base = filtered.dropna(subset=["price", "sqft"])
+_wtd_psf  = (_psf_base["price"].sum() / _psf_base["sqft"].sum()) if not _psf_base.empty else None
+
 c1, c2, c3, c4, c5 = st.columns(5)
 c1.metric("Listings",        f"{len(filtered):,}")
 c2.metric("Avg Price",       f"${filtered['price'].mean():,.0f}"    if filtered['price'].notna().any()     else "—")
 c3.metric("Avg $/SqFt",      f"${filtered['price_psf'].mean():,.0f}" if filtered['price_psf'].notna().any() else "—")
-c4.metric("Price Drops",     f"{int(filtered['price_drops'].sum()):,}")
-c5.metric("Cities",          filtered["city"].nunique())
+c4.metric("Wtd $/SqFt",      f"${_wtd_psf:,.0f}" if _wtd_psf else "—",
+          help="Total price ÷ total sqft across filtered listings")
+c5.metric("Price Drops",     f"{int(filtered['price_drops'].sum()):,}")
 
 st.divider()
 
@@ -316,11 +320,15 @@ with tab_summary:
                 avg_psf=("price_psf", "mean"),
                 median_psf=("price_psf", "median"),
                 avg_price=("price", "mean"),
+                _price_sum=("price", "sum"),
+                _sqft_sum=("sqft", "sum"),
                 avg_top_school=("top_rating", "mean"),
                 price_drops=("price_drops", "sum"),
             )
             .reset_index().sort_values("listings", ascending=False)
         )
+        city_agg["wtd_psf"] = (city_agg["_price_sum"] / city_agg["_sqft_sum"]).round(0).astype("Int64")
+        city_agg = city_agg.drop(columns=["_price_sum", "_sqft_sum"])
         for col in ["avg_psf", "median_psf", "avg_price"]:
             city_agg[col] = city_agg[col].round(0).astype("Int64")
         city_agg["avg_top_school"] = city_agg["avg_top_school"].round(1)
@@ -328,6 +336,7 @@ with tab_summary:
                      column_config={
                          "city": "City", "listings": "Listings",
                          "avg_psf": "Avg $/SqFt", "median_psf": "Median $/SqFt",
+                         "wtd_psf": "Wtd $/SqFt",
                          "avg_price": "Avg Price", "avg_top_school": "Avg Top School",
                          "price_drops": "Price Drops",
                      })
@@ -361,18 +370,22 @@ with tab_summary:
             listings=("address", "count"),
             avg_psf=("price_psf", "mean"),
             avg_price=("price", "mean"),
+            _price_sum=("price", "sum"),
+            _sqft_sum=("sqft", "sum"),
             avg_top_school=("top_rating", "mean"),
         )
         .reset_index().sort_values("listings", ascending=False)
     )
+    zip_agg["wtd_psf"] = (zip_agg["_price_sum"] / zip_agg["_sqft_sum"]).round(0).astype("Int64")
+    zip_agg = zip_agg.drop(columns=["_price_sum", "_sqft_sum"])
     zip_agg["avg_psf"]        = zip_agg["avg_psf"].round(0).astype("Int64")
     zip_agg["avg_price"]      = zip_agg["avg_price"].round(0).astype("Int64")
     zip_agg["avg_top_school"] = zip_agg["avg_top_school"].round(1)
     st.dataframe(zip_agg, use_container_width=True, hide_index=True,
                  column_config={
                      "zip": "Zip", "city": "City", "listings": "Listings",
-                     "avg_psf": "Avg $/SqFt", "avg_price": "Avg Price",
-                     "avg_top_school": "Avg Top School",
+                     "avg_psf": "Avg $/SqFt", "wtd_psf": "Wtd $/SqFt",
+                     "avg_price": "Avg Price", "avg_top_school": "Avg Top School",
                  })
 
     st.subheader("By School Rating Band")
