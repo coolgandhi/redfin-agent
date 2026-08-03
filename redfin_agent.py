@@ -589,6 +589,14 @@ def _compute_price_stats(current_price_str, price_history_str):
         return "0", "0"
 
 
+def _price_int(s):
+    """Parse a price string ($1,234,567 or 1234567) to int; 0 if unparseable."""
+    try:
+        return int(re.sub(r"[^\d]", "", str(s))) if s else 0
+    except (ValueError, TypeError):
+        return 0
+
+
 def _hoa_adj(price_str, hoa_str):
     """Capitalise HOA cost into purchase price equivalent (HOA/mo × 12 × 25)."""
     try:
@@ -604,11 +612,13 @@ def write_listings(sheets, listings, rows, addr_idx):
     For each listing:
       - If address not in sheet → batch append.
       - If address exists and new date > stored date → overwrite that row.
-    Returns (appended_count, updated_count).
+    Returns (appended_count, updated_count, new_addresses, price_drop_count).
     """
 
     rows_to_append = []
     update_requests = []
+    new_addresses = []      # addresses newly added this run (for the run feed)
+    price_drop_count = 0    # existing listings whose price dropped this run
 
     for l in listings:
         key = normalise_address(l["address"])
@@ -622,6 +632,7 @@ def write_listings(sheets, listings, rows, addr_idx):
             l["total_drop"]     = "0"
             l["hoa_adj_price"]  = _hoa_adj(l["price"], l["hoa"])
             rows_to_append.append(listing_to_row(l))
+            new_addresses.append(l["address"])
         else:
             # Check if new email date is more recent than stored date
             existing_row     = rows[addr_idx[key] - 1]
@@ -633,6 +644,10 @@ def write_listings(sheets, listings, rows, addr_idx):
                 stored_date = datetime.strptime(stored_date_str, "%Y-%m-%d")
                 new_date    = datetime.strptime(l["date"], "%Y-%m-%d")
                 if new_date > stored_date:
+                    # Count a price drop when the new price is lower than stored
+                    if _price_int(stored_price) and \
+                            _price_int(l["price"]) < _price_int(stored_price):
+                        price_drop_count += 1
                     # Prepend old price to history if the price changed
                     if stored_price and stored_price != l["price"]:
                         entry = f"{stored_date_str}:{stored_price}"
@@ -680,7 +695,7 @@ def write_listings(sheets, listings, rows, addr_idx):
         ).execute())
         updated = len(update_requests)
 
-    return appended, updated
+    return appended, updated, new_addresses, price_drop_count
 
 # ─── SQLITE ──────────────────────────────────────────────────────────────────
 
@@ -875,6 +890,111 @@ def log_run(sheets, run_start, mode, n_emails, n_listings, n_unique,
     ).execute())
 
 
+RUNS_TABLE_DDL = """
+    CREATE TABLE IF NOT EXISTS runs (
+        id               INTEGER PRIMARY KEY AUTOINCREMENT,
+        run_start        TEXT,
+        run_end          TEXT,
+        duration_sec     REAL,
+        mode             TEXT,
+        emails_scanned   INTEGER,
+        listings_found   INTEGER,
+        unique_addresses INTEGER,
+        rows_added       INTEGER,
+        rows_updated     INTEGER,
+        price_drops      INTEGER,
+        new_addresses    TEXT,
+        total_listings   INTEGER,
+        status           TEXT,
+        error            TEXT
+    )
+"""
+
+
+def log_run_sqlite(run_start, run_end, mode, n_emails, n_listings, n_unique,
+                   n_added, n_updated, n_price_drops, new_addresses,
+                   total_listings, status, error):
+    """Persist a per-run summary to the local SQLite DB for the dashboard feed.
+
+    Wrapped in a broad try/except so run-logging can never crash the agent.
+    """
+    try:
+        conn = sqlite3.connect(DB_FILE)
+        conn.execute(RUNS_TABLE_DDL)
+        conn.execute("""
+            INSERT INTO runs (
+                run_start, run_end, duration_sec, mode, emails_scanned,
+                listings_found, unique_addresses, rows_added, rows_updated,
+                price_drops, new_addresses, total_listings, status, error)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+        """, (
+            run_start.strftime("%Y-%m-%d %H:%M:%S"),
+            run_end.strftime("%Y-%m-%d %H:%M:%S"),
+            round((run_end - run_start).total_seconds(), 1),
+            mode, n_emails, n_listings, n_unique, n_added, n_updated,
+            n_price_drops, "\n".join(new_addresses or []), total_listings,
+            status, error,
+        ))
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        print(f"    ⚠ Could not log run to SQLite: {e}")
+
+
+def backfill_runs():
+    """Backfill the SQLite `runs` table from the Google Sheets 'Runs' tab.
+
+    The agent logged every run to the sheet before the SQLite feed existed, so
+    this seeds the dashboard's Run Feed with real history. Fields added later
+    (duration, price drops, new addresses, running total) weren't tracked back
+    then and are left NULL/blank. Idempotent: skips run_start values already
+    present, so it's safe to re-run.
+    """
+    _, sheets = get_google_services()
+    result = _with_retry(lambda: sheets.spreadsheets().values().get(
+        spreadsheetId=SHEET_ID,
+        range=f"{RUNS_TAB}!A2:I",
+    ).execute())
+    rows = result.get("values", [])
+    if not rows:
+        print("No run history found in the Runs tab — nothing to backfill.")
+        return
+
+    def _i(v):
+        try:
+            return int(v)
+        except (ValueError, TypeError):
+            return 0
+
+    conn = sqlite3.connect(DB_FILE)
+    conn.execute(RUNS_TABLE_DDL)
+    existing = {r[0] for r in conn.execute("SELECT run_start FROM runs")}
+    inserted = 0
+    for row in rows:
+        # Columns: Timestamp, Mode, Emails, Listings, Unique, Added, Updated, Status, Error
+        ts, mode, emails, listings, unique, added, updated, status, error = \
+            (row + [""] * 9)[:9]
+        if not ts or ts in existing:
+            continue
+        conn.execute("""
+            INSERT INTO runs (
+                run_start, run_end, duration_sec, mode, emails_scanned,
+                listings_found, unique_addresses, rows_added, rows_updated,
+                price_drops, new_addresses, total_listings, status, error)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+        """, (
+            ts, ts, None, mode, _i(emails), _i(listings), _i(unique),
+            _i(added), _i(updated), None, "", None,
+            status or "Success", error,
+        ))
+        existing.add(ts)
+        inserted += 1
+    conn.commit()
+    conn.close()
+    print(f"✅ Backfilled {inserted} run(s) from the Runs tab into SQLite "
+          f"({len(rows)} row(s) scanned).")
+
+
 # ─── MAIN ────────────────────────────────────────────────────────────────────
 
 def main():
@@ -900,6 +1020,9 @@ def main():
     all_listings = []
     deduped     = []
     appended = updated = 0
+    new_addresses = []
+    price_drops    = 0
+    total_listings = 0
     error_msg   = ""
 
     try:
@@ -1025,12 +1148,21 @@ def main():
 
         # ── Write to Sheets ───────────────────────────────────────────────────────
         print(f"\n📝 Writing to Google Sheets…")
-        appended, updated = write_listings(sheets, deduped, existing_rows, addr_to_row)
+        appended, updated, new_addresses, price_drops = write_listings(
+            sheets, deduped, existing_rows, addr_to_row)
         print(f"   ✅ {appended} new row(s) added, {updated} row(s) updated")
 
         # ── Write to SQLite ───────────────────────────────────────────────────────
         if deduped:
             upsert_sqlite(deduped)
+
+        # Running total of listings in the DB, for the run feed
+        try:
+            _c = sqlite3.connect(DB_FILE)
+            total_listings = _c.execute("SELECT COUNT(*) FROM listings").fetchone()[0]
+            _c.close()
+        except Exception:
+            pass
 
         # ── Mark emails as read ───────────────────────────────────────────────────
         if mode == "periodic":
@@ -1059,11 +1191,17 @@ def main():
         status = "Failed" if error_msg else "Success"
         log_run(sheets, run_start, mode, len(messages), len(all_listings),
                 len(deduped), appended, updated, status, error_msg)
+        log_run_sqlite(run_start, datetime.now(), mode, len(messages),
+                       len(all_listings), len(deduped), appended, updated,
+                       price_drops, new_addresses, total_listings,
+                       status, error_msg)
 
 
 if __name__ == "__main__":
     if "--backfill-property-type" in sys.argv:
         backfill_property_type()
+    elif "--backfill-runs" in sys.argv:
+        backfill_runs()
     else:
         try:
             main()

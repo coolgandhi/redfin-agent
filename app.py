@@ -73,6 +73,29 @@ def load_data():
     return df
 
 
+def load_runs(limit, offset=0):
+    """Fetch agent-run summaries newest-first with LIMIT/OFFSET for the feed.
+
+    Returns (DataFrame of at most `limit` rows, total run count). Never loads
+    the whole history at once. Not cached so new runs show on refresh.
+    """
+    if not os.path.exists(DB_FILE):
+        return pd.DataFrame(), 0
+    conn = sqlite3.connect(DB_FILE)
+    try:
+        total = conn.execute("SELECT COUNT(*) FROM runs").fetchone()[0]
+        runs = pd.read_sql(
+            "SELECT * FROM runs ORDER BY id DESC LIMIT ? OFFSET ?",
+            conn, params=(limit, offset),
+        )
+    except (pd.errors.DatabaseError, sqlite3.OperationalError):
+        # `runs` table doesn't exist yet (no agent run since the feature shipped)
+        return pd.DataFrame(), 0
+    finally:
+        conn.close()
+    return runs, total
+
+
 df = load_data()
 
 st.title("🏠 Redfin Listings Dashboard")
@@ -183,7 +206,8 @@ st.divider()
 
 # ─── Tabs ─────────────────────────────────────────────────────────────────────
 
-tab_trends, tab_explore, tab_summary = st.tabs(["📈 Trends", "🔍 Explore", "📊 Summary"])
+tab_trends, tab_explore, tab_summary, tab_feed = st.tabs(
+    ["📈 Trends", "🔍 Explore", "📊 Summary", "🗒️ Run Feed"])
 
 # ══════════════════════════════════════════════════════════════════════════════
 # TAB 1 — TRENDS  (uses filtered)
@@ -418,3 +442,73 @@ with tab_summary:
                      "rating_band": "Rating Band", "listings": "Listings",
                      "avg_psf": "Avg $/SqFt", "avg_price": "Avg Price",
                  })
+
+# ─── Run Feed ─────────────────────────────────────────────────────────────────
+
+with tab_feed:
+    st.subheader("🗒️ Agent Run Feed")
+    st.caption("Summary of each agent run, newest first. "
+               "Populated after the agent runs; older runs load on demand.")
+
+    def _int(v):
+        return int(v) if pd.notna(v) else 0
+
+    PAGE = 10
+    if "feed_n" not in st.session_state:
+        st.session_state.feed_n = PAGE
+
+    runs_df, total_runs = load_runs(st.session_state.feed_n)
+
+    if total_runs == 0:
+        st.info("No runs recorded yet. The feed populates after the next agent run.")
+    else:
+        # Rollups across the whole run history (cheap single-row aggregates)
+        conn = sqlite3.connect(DB_FILE)
+        agg = conn.execute(
+            "SELECT COUNT(*), COALESCE(SUM(rows_added),0), "
+            "COALESCE(SUM(price_drops),0), "
+            "SUM(CASE WHEN status='Failed' THEN 1 ELSE 0 END) FROM runs"
+        ).fetchone()
+        conn.close()
+        k = st.columns(4)
+        k[0].metric("Total runs", agg[0])
+        k[1].metric("Listings added (all time)", agg[1])
+        k[2].metric("Price drops seen", agg[2])
+        k[3].metric("Failed runs", agg[3])
+        st.divider()
+        st.caption(f"Showing {len(runs_df)} of {total_runs} runs")
+
+        for _, r in runs_df.iterrows():
+            ok = str(r["status"]).lower() == "success"
+            icon = "✅" if ok else "❌"
+            with st.container(border=True):
+                head = st.columns([3, 1])
+                head[0].markdown(
+                    f"**{icon} {r['run_start']}** &nbsp;·&nbsp; "
+                    f"{str(r['mode']).title()} run")
+                dur = r["duration_sec"]
+                head[1].markdown(
+                    f"<div style='text-align:right;color:#888'>⏱ {dur:.0f}s</div>"
+                    if pd.notna(dur) else "", unsafe_allow_html=True)
+
+                m = st.columns(5)
+                m[0].metric("🆕 Added", _int(r["rows_added"]))
+                m[1].metric("♻️ Updated", _int(r["rows_updated"]))
+                m[2].metric("📉 Price drops", _int(r["price_drops"]))
+                m[3].metric("📧 Emails", _int(r["emails_scanned"]))
+                m[4].metric("🏠 Total in DB", _int(r["total_listings"]))
+
+                addr_blob = str(r["new_addresses"] or "").strip()
+                if addr_blob:
+                    addrs = [a for a in addr_blob.split("\n") if a.strip()]
+                    with st.expander(f"🆕 {len(addrs)} new listing(s) this run"):
+                        for a in addrs:
+                            st.write(f"• {a.title()}")
+
+                if not ok and str(r["error"] or "").strip():
+                    st.error(str(r["error"]))
+
+        if len(runs_df) < total_runs:
+            if st.button("Load more ↓", key="feed_more"):
+                st.session_state.feed_n += PAGE
+                st.rerun()
