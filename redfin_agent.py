@@ -85,6 +85,11 @@ SCHOOL_REFRESH_DAYS = 90
 # Number of parallel workers for school page fetches
 MAX_SCHOOL_WORKERS = 5
 
+# Sanity ceiling for price-per-sqft. A parsed price that yields more than this
+# is almost certainly corrupt (e.g. a 100x parsing glitch), so we drop the bad
+# price/psf and flag it for review rather than writing garbage to the store.
+MAX_PLAUSIBLE_PSF = 5000
+
 # Column order written to the sheet
 COLUMNS = [
     "Date", "Address", "City", "Zip", "Status",
@@ -290,6 +295,16 @@ def parse_listings_from_html(html, email_date):
         try:
             price_psf = round(int(price_str) / int(sqft_str)) if price_str and sqft_str else ""
         except (ValueError, ZeroDivisionError):
+            price_psf = ""
+
+        # Guardrail: an implausibly high $/sqft means the price was mis-parsed
+        # (e.g. $215,000,000 instead of $2,150,000). Drop the bad price/psf and
+        # flag for review rather than persisting corrupt data.
+        if price_psf != "" and price_psf > MAX_PLAUSIBLE_PSF:
+            print(f"    ⚠ Implausible price/sqft (${price_psf}/sqft) for "
+                  f"{addr_text or '(unknown address)'} — price=${price_str}, "
+                  f"sqft={sqft_str}. Dropping price for review.")
+            price_str = ""
             price_psf = ""
 
         # Address parsing
