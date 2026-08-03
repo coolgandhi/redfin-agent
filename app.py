@@ -230,7 +230,7 @@ with tab_trends:
             fig1.for_each_trace(lambda t: t.update(
                 name={"avg_psf": "Avg", "median_psf": "Median", "wtd_psf": "Wtd"}[t.name]
             ))
-            st.plotly_chart(fig1, use_container_width=True)
+            st.plotly_chart(fig1, width='stretch')
 
         with col_r:
             st.subheader("Listing Volume by Status")
@@ -242,7 +242,7 @@ with tab_trends:
                 vol_trend, x="period", y="count", color="status", barmode="stack",
                 labels={"count": "Listings", "period": gran, "status": "Status"},
             )
-            st.plotly_chart(fig2, use_container_width=True)
+            st.plotly_chart(fig2, width='stretch')
 
         st.subheader("Avg Price Over Time")
         price_trend = (
@@ -259,7 +259,7 @@ with tab_trends:
         fig3.for_each_trace(lambda t: t.update(
             name={"avg_price": "Avg", "median_price": "Median"}[t.name]
         ))
-        st.plotly_chart(fig3, use_container_width=True)
+        st.plotly_chart(fig3, width='stretch')
 
 # ══════════════════════════════════════════════════════════════════════════════
 # TAB 2 — EXPLORE  (uses filtered — no duplicate filter UI)
@@ -287,7 +287,7 @@ with tab_explore:
 
     st.dataframe(
         display,
-        use_container_width=True,
+        width='stretch',
         column_config={
             "url":               st.column_config.LinkColumn("URL", display_text="View"),
             "date":              "Date",
@@ -341,7 +341,7 @@ with tab_summary:
         for col in ["avg_psf", "median_psf", "avg_price"]:
             city_agg[col] = city_agg[col].round(0).astype("Int64")
         city_agg["avg_top_school"] = city_agg["avg_top_school"].round(1)
-        st.dataframe(city_agg, use_container_width=True, hide_index=True,
+        st.dataframe(city_agg, width='stretch', hide_index=True,
                      column_config={
                          "city": "City", "listings": "Listings",
                          "avg_psf": "Avg $/SqFt", "median_psf": "Median $/SqFt",
@@ -365,7 +365,7 @@ with tab_summary:
         status_agg["avg_psf"]     = status_agg["avg_psf"].round(0).astype("Int64")
         status_agg["avg_price"]   = status_agg["avg_price"].round(0).astype("Int64")
         status_agg["most_recent"] = status_agg["most_recent"].dt.strftime("%Y-%m-%d")
-        st.dataframe(status_agg, use_container_width=True, hide_index=True,
+        st.dataframe(status_agg, width='stretch', hide_index=True,
                      column_config={
                          "status": "Status", "listings": "Listings",
                          "avg_psf": "Avg $/SqFt", "avg_price": "Avg Price",
@@ -390,7 +390,7 @@ with tab_summary:
     zip_agg["avg_psf"]        = zip_agg["avg_psf"].round(0).astype("Int64")
     zip_agg["avg_price"]      = zip_agg["avg_price"].round(0).astype("Int64")
     zip_agg["avg_top_school"] = zip_agg["avg_top_school"].round(1)
-    st.dataframe(zip_agg, use_container_width=True, hide_index=True,
+    st.dataframe(zip_agg, width='stretch', hide_index=True,
                  column_config={
                      "zip": "Zip", "city": "City", "listings": "Listings",
                      "avg_psf": "Avg $/SqFt", "wtd_psf": "Wtd $/SqFt",
@@ -413,7 +413,7 @@ with tab_summary:
     )
     band_agg["avg_psf"]   = band_agg["avg_psf"].round(0).astype("Int64")
     band_agg["avg_price"] = band_agg["avg_price"].round(0).astype("Int64")
-    st.dataframe(band_agg, use_container_width=True, hide_index=True,
+    st.dataframe(band_agg, width='stretch', hide_index=True,
                  column_config={
                      "rating_band": "Rating Band", "listings": "Listings",
                      "avg_psf": "Avg $/SqFt", "avg_price": "Avg Price",
