@@ -386,7 +386,10 @@ def fetch_listing_data(listing_url):
         time.sleep(FETCH_DELAY)
         resp = requests.get(listing_url, headers=HEADERS, timeout=15)
         if resp.status_code != 200:
-            return {"schools": [], "hoa": ""}
+            # Non-200 (e.g. Redfin's 202 bot-mitigation challenge) means the page
+            # wasn't served — flag as blocked so the caller doesn't cache the
+            # empty result as if it were a genuine "no schools" answer.
+            return {"schools": [], "hoa": "", "property_type": "", "blocked": True}
         soup = BeautifulSoup(resp.text, "lxml")
 
         # ── Schools ──────────────────────────────────────────────────────────
@@ -447,10 +450,12 @@ def fetch_listing_data(listing_url):
         if prop_m:
             prop_type = prop_m.group(1).strip().title()
 
-        return {"schools": schools, "hoa": hoa, "property_type": prop_type}
+        return {"schools": schools, "hoa": hoa, "property_type": prop_type,
+                "blocked": False}
     except Exception as e:
         print(f"    ⚠ Could not fetch listing data for {listing_url}: {e}")
-        return {"schools": [], "hoa": "", "property_type": ""}
+        # Network/parse error — treat like a block so we retry rather than cache empty.
+        return {"schools": [], "hoa": "", "property_type": "", "blocked": True}
 
 # ─── GOOGLE SHEETS ───────────────────────────────────────────────────────────
 
@@ -1115,7 +1120,7 @@ def main():
                 l["hoa"] = cached.get("hoa", "")
                 l["property_type"] = cached.get("property_type", "")
             else:
-                to_fetch.append((i, l, cached is not None))
+                to_fetch.append((i, l, cached))
 
         # Fetch school data in parallel for listings that need it
         if to_fetch:
@@ -1124,25 +1129,44 @@ def main():
                   f"(up to {MAX_SCHOOL_WORKERS} parallel)…")
             with ThreadPoolExecutor(max_workers=MAX_SCHOOL_WORKERS) as executor:
                 futures = {
-                    executor.submit(fetch_listing_data, l["url"]): (i, l, stale)
-                    for i, l, stale in to_fetch
+                    executor.submit(fetch_listing_data, l["url"]): (i, l, cached)
+                    for i, l, cached in to_fetch
                 }
                 for future in as_completed(futures):
-                    i, l, stale = futures[future]
+                    i, l, cached = futures[future]
+                    stale = cached is not None
                     data = future.result()
                     schools = data["schools"]
-                    for j, s in enumerate(schools[:3], 1):
-                        l[f"school{j}"] = s["name"]
-                        l[f"type{j}"]   = s["type"]
-                        l[f"rating{j}"] = s["rating"]
-                    l["hoa"] = data["hoa"]
-                    l["property_type"] = data.get("property_type", "")
-                    l["schools_updated"] = today
+                    blocked = data.get("blocked", False)
+                    if blocked and cached:
+                        # Blocked while refreshing stale data — keep the old cached
+                        # schools/hoa rather than overwriting them with blanks.
+                        for j, (name, kind, rating) in enumerate(cached["schools"][:3], 1):
+                            l[f"school{j}"] = name
+                            l[f"type{j}"]   = kind
+                            l[f"rating{j}"] = rating
+                        l["hoa"] = cached.get("hoa", "")
+                        l["property_type"] = cached.get("property_type", "")
+                        l["schools_updated"] = cached.get("updated", "")
+                    else:
+                        for j, s in enumerate(schools[:3], 1):
+                            l[f"school{j}"] = s["name"]
+                            l[f"type{j}"]   = s["type"]
+                            l[f"rating{j}"] = s["rating"]
+                        l["hoa"] = data["hoa"]
+                        l["property_type"] = data.get("property_type", "")
+                    # Only stamp schools_updated on a real response. A block (202
+                    # bot-challenge / network error) leaves it unset so the listing
+                    # is retried next run instead of caching empty for 90 days.
+                    if not blocked:
+                        l["schools_updated"] = today
                     action = "refreshed" if stale else "fetched"
                     hoa_str = f"  HOA: {data['hoa']}" if data["hoa"] else ""
                     if schools:
                         names = ", ".join(s["name"][:25] for s in schools)
                         print(f"  🏫 [{i}/{len(deduped)}] {l['address']} → {action}: {names}{hoa_str}")
+                    elif blocked:
+                        print(f"  🏫 [{i}/{len(deduped)}] {l['address']} → blocked (will retry)")
                     else:
                         print(f"  🏫 [{i}/{len(deduped)}] {l['address']} → no schools found{hoa_str}")
 
