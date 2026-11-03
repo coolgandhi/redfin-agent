@@ -940,6 +940,86 @@ def backfill_property_type():
     print(f"\n✅ Backfill complete — {found}/{len(results)} listing(s) got a property type.")
 
 
+def reenrich_blank_schools(limit=None):
+    """Re-fetch school data for listings that have no schools recorded.
+
+    Heals the backlog of listings that were saved with blank schools while
+    Redfin's bot-challenge was blocking fetches. Targets rows with an empty
+    School1 and a URL; re-fetches via the headless browser and writes any newly
+    found schools/HOA/property type back to both the sheet and SQLite. Blocked
+    fetches are left untouched so they stay eligible for a later retry.
+
+    `limit` caps how many blank listings to process (useful for a first pass).
+    """
+    _, sheets = get_google_services()
+    rows, addr_idx = read_sheet(sheets)
+    listings = _sheet_rows_to_listings(rows)
+
+    blanks = [l for l in listings if not (l.get("school1") or "").strip()
+              and (l.get("url") or "").strip()]
+    if limit:
+        blanks = blanks[:limit]
+
+    if not blanks:
+        print("✅ No blank-school listings with a URL — nothing to re-enrich.")
+        return
+
+    engine = "headless browser" if USE_BROWSER else "requests"
+    print(f"🏫 Re-enriching schools for {len(blanks)} blank listing(s) "
+          f"via {engine}…\n")
+
+    today = datetime.now().strftime("%Y-%m-%d")
+    updated_listings = []   # listings whose data changed, for write-back
+    update_requests = []    # sheet batchUpdate payload
+    filled = blocked = still_empty = 0
+
+    with browser_session() as ctx:
+        for i, l in enumerate(blanks, 1):
+            data = fetch_listing_data(l["url"], ctx)
+            if data.get("blocked"):
+                blocked += 1
+                print(f"  [{i}/{len(blanks)}] {l['address']} → blocked (will retry)")
+                continue
+            schools = data["schools"]
+            for j in range(1, 4):
+                s = schools[j - 1] if j - 1 < len(schools) else None
+                l[f"school{j}"] = s["name"]   if s else ""
+                l[f"type{j}"]   = s["type"]   if s else ""
+                l[f"rating{j}"] = s["rating"] if s else ""
+            l["hoa"] = data["hoa"] or l.get("hoa", "")
+            l["property_type"] = data.get("property_type", "") or l.get("property_type", "")
+            l["schools_updated"] = today   # successful fetch → stamp it
+            updated_listings.append(l)
+
+            key = normalise_address(l["address"])
+            row_num = addr_idx.get(key)
+            if row_num:
+                update_requests.append({
+                    "range": f"{SHEET_TAB}!A{row_num}:AC{row_num}",
+                    "values": [listing_to_row(l)],
+                })
+            if schools:
+                filled += 1
+                names = ", ".join(s["name"][:25] for s in schools)
+                print(f"  [{i}/{len(blanks)}] {l['address']} → filled: {names}")
+            else:
+                still_empty += 1
+                print(f"  [{i}/{len(blanks)}] {l['address']} → no schools (genuine)")
+
+    # Write back: sheet rows in one batch, then mirror to SQLite.
+    if update_requests:
+        _with_retry(lambda: sheets.spreadsheets().values().batchUpdate(
+            spreadsheetId=SHEET_ID,
+            body={"valueInputOption": "USER_ENTERED", "data": update_requests},
+        ).execute())
+    if updated_listings:
+        upsert_sqlite(updated_listings)
+
+    print(f"\n✅ Re-enrich complete — {filled} filled, {still_empty} genuinely "
+          f"school-less, {blocked} still blocked (will retry later). "
+          f"{len(update_requests)} row(s) written.")
+
+
 # ─── RUN LOGGING ─────────────────────────────────────────────────────────────
 
 RUNS_COLUMNS = [
@@ -1315,6 +1395,12 @@ if __name__ == "__main__":
         backfill_property_type()
     elif "--backfill-runs" in sys.argv:
         backfill_runs()
+    elif "--reenrich-blanks" in sys.argv:
+        # Optional numeric cap: --reenrich-blanks 50
+        _i = sys.argv.index("--reenrich-blanks")
+        _limit = int(sys.argv[_i + 1]) if _i + 1 < len(sys.argv) \
+            and sys.argv[_i + 1].isdigit() else None
+        reenrich_blank_schools(_limit)
     else:
         try:
             main()
