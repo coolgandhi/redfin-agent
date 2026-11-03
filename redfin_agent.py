@@ -20,7 +20,7 @@ import sys
 import time
 import json
 import sqlite3
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from email import message_from_bytes
 from html.parser import HTMLParser
@@ -82,8 +82,16 @@ FETCH_DELAY = 1.5
 # Re-fetch school data if it was last updated more than this many days ago
 SCHOOL_REFRESH_DAYS = 90
 
-# Number of parallel workers for school page fetches
-MAX_SCHOOL_WORKERS = 5
+# Render listing pages with a headless browser (Playwright) so Redfin's
+# JavaScript bot-mitigation challenge resolves. Plain HTTP requests get a 202
+# challenge stub instead of the page; a real browser engine clears it. Set to
+# False to force the (usually blocked) requests path.
+USE_BROWSER = True
+# Max time to wait for the challenge to resolve and the real page to render.
+BROWSER_WAIT_SEC = 20
+# A rendered listing page is >1MB; the challenge stub is ~2KB. Anything smaller
+# than this after waiting is still the stub → treat as blocked.
+MIN_RENDERED_BYTES = 50000
 
 # Sanity ceiling for price-per-sqft. A parsed price that yields more than this
 # is almost certainly corrupt (e.g. a 100x parsing glitch), so we drop the bad
@@ -374,88 +382,177 @@ HEADERS = {
 }
 
 
-def fetch_listing_data(listing_url):
+@contextmanager
+def browser_session():
+    """Yield a Playwright browser context for rendering listing pages.
+
+    Yields None (falling back to plain requests) if browsing is disabled or
+    Playwright isn't available. The single browser is created and closed in the
+    calling thread, so there are no cross-thread teardown or leaked-process
+    issues — callers fetch sequentially through the yielded context.
+    """
+    if not USE_BROWSER:
+        yield None
+        return
+    try:
+        from playwright.sync_api import sync_playwright
+    except ImportError:
+        print("    ⚠ Playwright not installed — falling back to plain requests "
+              "(Redfin will likely block school fetches). To enable: "
+              "pip install playwright && python3 -m playwright install chromium")
+        yield None
+        return
+
+    pw = sync_playwright().start()
+    browser = None
+    try:
+        browser = pw.chromium.launch(headless=True)
+        ctx = browser.new_context(
+            user_agent=HEADERS["User-Agent"],
+            viewport={"width": 1280, "height": 900},
+            locale="en-US",
+        )
+        # Minimal stealth: hide the automation flag some challenges check for.
+        ctx.add_init_script(
+            "Object.defineProperty(navigator,'webdriver',{get:()=>undefined})")
+        yield ctx
+    except Exception as e:
+        print(f"    ⚠ Could not start headless browser ({e}); "
+              f"falling back to plain requests.")
+        yield None
+    finally:
+        try:
+            if browser:
+                browser.close()
+        except Exception:
+            pass
+        try:
+            pw.stop()
+        except Exception:
+            pass
+
+
+def _fetch_listing_html(listing_url, ctx):
+    """Return (html, blocked) for a listing page.
+
+    With a browser context, render the page and wait for Redfin's JS challenge
+    to resolve (the real page is >1MB; the challenge stub is ~2KB). Without one,
+    fall back to a plain requests GET (usually blocked).
+    """
+    if ctx is None:
+        resp = requests.get(listing_url, headers=HEADERS, timeout=15)
+        if resp.status_code != 200 or not resp.text:
+            return None, True
+        return resp.text, False
+
+    page = ctx.new_page()
+    try:
+        page.goto(listing_url, wait_until="domcontentloaded", timeout=30000)
+        deadline = time.time() + BROWSER_WAIT_SEC
+        html = page.content()
+        # Poll until the challenge clears and the real page renders, or we time out.
+        while len(html) < MIN_RENDERED_BYTES and time.time() < deadline:
+            page.wait_for_timeout(1000)
+            html = page.content()
+    finally:
+        page.close()
+
+    if len(html) < MIN_RENDERED_BYTES:
+        return None, True   # still the challenge stub → blocked
+    return html, False
+
+
+def fetch_listing_data(listing_url, ctx=None):
     """
     Fetch the Redfin listing page and extract:
     - Up to 3 nearby schools with name, type, and GreatSchools rating
     - HOA monthly fee if present
     - Property type (Single Family, Condo, Townhouse, etc.)
-    Returns {"schools": [{name, type, rating}, ...], "hoa": "", "property_type": ""}
+    `ctx` is an optional Playwright browser context (see browser_session).
+    Returns {"schools": [...], "hoa": "", "property_type": "", "blocked": bool}
     """
     try:
         time.sleep(FETCH_DELAY)
-        resp = requests.get(listing_url, headers=HEADERS, timeout=15)
-        if resp.status_code != 200:
-            # Non-200 (e.g. Redfin's 202 bot-mitigation challenge) means the page
-            # wasn't served — flag as blocked so the caller doesn't cache the
+        html, blocked = _fetch_listing_html(listing_url, ctx)
+        if blocked or not html:
+            # Blocked / no page served — flag it so the caller doesn't cache the
             # empty result as if it were a genuine "no schools" answer.
             return {"schools": [], "hoa": "", "property_type": "", "blocked": True}
-        soup = BeautifulSoup(resp.text, "lxml")
-
-        # ── Schools ──────────────────────────────────────────────────────────
-        schools = []
-        # School rows are <div class="flex align-center"> containing:
-        # "Taft Elementary School Public K-5 • Assigned • 0.4mi 4/10"
-        # Environmental factors (Flood/Fire/Heat/Wind/Air) also have X/10
-        # but live in <div class="ListItem__content ..."> — we exclude those.
-        score_re = re.compile(r"(\d+)\s*/\s*10")
-        school_type_re = re.compile(
-            r"\b(Elementary|Middle|High|K-\d+|K-12|Charter|Private|PreK)\b", re.I
-        )
-        env_re = re.compile(
-            r"\b(Flood|Fire|Heat|Wind|Air|Storm|Drought)\s+Factor\b", re.I
-        )
-
-        for div in soup.find_all("div"):
-            classes = " ".join(div.get("class") or [])
-            # Target the school row divs; skip environmental-factor divs
-            if "flex" not in classes or "align-center" not in classes:
-                continue
-            text = _clean(div.get_text(" ", strip=True))
-            if env_re.search(text):
-                continue
-            score_m = score_re.search(text)
-            if not score_m:
-                continue
-            type_m = school_type_re.search(text)
-            if not type_m:
-                continue
-            rating = score_m.group(1)
-            kind   = type_m.group(1).title()
-            # School name is the leading text before the school type keyword
-            name = text[:type_m.start()].strip().rstrip("•·-– ")
-            if name and len(name) > 3:
-                schools.append({"name": name, "type": kind, "rating": rating})
-            if len(schools) == 3:
-                break
-
-        # ── HOA ──────────────────────────────────────────────────────────────
-        hoa = ""
-        page_text = soup.get_text(" ")
-        hoa_m = re.search(
-            r'HOA\s+(?:Dues?|Fee)?\s*[:\-]?\s*\$\s*([\d,]+)', page_text, re.I
-        )
-        if hoa_m:
-            hoa = "$" + hoa_m.group(1).replace(",", "")
-
-        # ── Property Type ─────────────────────────────────────────────────────
-        # Redfin pages render the value before the label: "Condo Property Type"
-        prop_type = ""
-        prop_m = re.search(
-            r'(Single[- ]Family(?:\s+Residential)?|Condo(?:/Co-op)?|Townhome|Townhouse|'
-            r'Multi[- ]Family[^\n\r]{0,20}|Manufactured(?:\s+Home)?|Mobile(?:\s+Home)?|'
-            r'Co-op|Land)\s+Property\s+Type\b',
-            page_text, re.I
-        )
-        if prop_m:
-            prop_type = prop_m.group(1).strip().title()
-
-        return {"schools": schools, "hoa": hoa, "property_type": prop_type,
-                "blocked": False}
+        data = _parse_listing_html(html)
+        data["blocked"] = False
+        return data
     except Exception as e:
         print(f"    ⚠ Could not fetch listing data for {listing_url}: {e}")
         # Network/parse error — treat like a block so we retry rather than cache empty.
         return {"schools": [], "hoa": "", "property_type": "", "blocked": True}
+
+
+def _parse_listing_html(html):
+    """Parse schools, HOA, and property type out of a rendered listing page.
+
+    Returns {"schools": [{name, type, rating}, ...], "hoa": "", "property_type": ""}.
+    """
+    soup = BeautifulSoup(html, "lxml")
+
+    # ── Schools ──────────────────────────────────────────────────────────
+    schools = []
+    # School rows are <div class="flex align-center"> containing:
+    # "Taft Elementary School Public K-5 • Assigned • 0.4mi 4/10"
+    # Environmental factors (Flood/Fire/Heat/Wind/Air) also have X/10
+    # but live in <div class="ListItem__content ..."> — we exclude those.
+    score_re = re.compile(r"(\d+)\s*/\s*10")
+    school_type_re = re.compile(
+        r"\b(Elementary|Middle|High|K-\d+|K-12|Charter|Private|PreK)\b", re.I
+    )
+    env_re = re.compile(
+        r"\b(Flood|Fire|Heat|Wind|Air|Storm|Drought)\s+Factor\b", re.I
+    )
+
+    for div in soup.find_all("div"):
+        classes = " ".join(div.get("class") or [])
+        # Target the school row divs; skip environmental-factor divs
+        if "flex" not in classes or "align-center" not in classes:
+            continue
+        text = _clean(div.get_text(" ", strip=True))
+        if env_re.search(text):
+            continue
+        score_m = score_re.search(text)
+        if not score_m:
+            continue
+        type_m = school_type_re.search(text)
+        if not type_m:
+            continue
+        rating = score_m.group(1)
+        kind   = type_m.group(1).title()
+        # School name is the leading text before the school type keyword
+        name = text[:type_m.start()].strip().rstrip("•·-– ")
+        if name and len(name) > 3:
+            schools.append({"name": name, "type": kind, "rating": rating})
+        if len(schools) == 3:
+            break
+
+    # ── HOA ──────────────────────────────────────────────────────────────
+    hoa = ""
+    page_text = soup.get_text(" ")
+    hoa_m = re.search(
+        r'HOA\s+(?:Dues?|Fee)?\s*[:\-]?\s*\$\s*([\d,]+)', page_text, re.I
+    )
+    if hoa_m:
+        hoa = "$" + hoa_m.group(1).replace(",", "")
+
+    # ── Property Type ─────────────────────────────────────────────────────
+    # Redfin pages render the value before the label: "Condo Property Type"
+    prop_type = ""
+    prop_m = re.search(
+        r'(Single[- ]Family(?:\s+Residential)?|Condo(?:/Co-op)?|Townhome|Townhouse|'
+        r'Multi[- ]Family[^\n\r]{0,20}|Manufactured(?:\s+Home)?|Mobile(?:\s+Home)?|'
+        r'Co-op|Land)\s+Property\s+Type\b',
+        page_text, re.I
+    )
+    if prop_m:
+        prop_type = prop_m.group(1).strip().title()
+
+    return {"schools": schools, "hoa": hoa, "property_type": prop_type}
 
 # ─── GOOGLE SHEETS ───────────────────────────────────────────────────────────
 
@@ -820,18 +917,14 @@ def backfill_property_type():
         print("✅ All listings already have a property type — nothing to backfill.")
         return
 
+    engine = "headless browser" if USE_BROWSER else "requests"
     print(f"🏠 Backfilling property type for {len(rows)} listing(s) "
-          f"(up to {MAX_SCHOOL_WORKERS} parallel)…\n")
+          f"via {engine}…\n")
 
     results = []
-    with ThreadPoolExecutor(max_workers=MAX_SCHOOL_WORKERS) as executor:
-        futures = {
-            executor.submit(fetch_listing_data, url): (addr, url)
-            for addr, url in rows
-        }
-        for i, future in enumerate(as_completed(futures), 1):
-            addr, url = futures[future]
-            data = future.result()
+    with browser_session() as ctx:
+        for i, (addr, url) in enumerate(rows, 1):
+            data = fetch_listing_data(url, ctx)
             prop_type = data.get("property_type", "")
             results.append((prop_type, addr))
             print(f"  [{i}/{len(rows)}] {addr} → {prop_type or '(not found)'}")
@@ -1122,20 +1215,16 @@ def main():
             else:
                 to_fetch.append((i, l, cached))
 
-        # Fetch school data in parallel for listings that need it
+        # Fetch school data for listings that need it. We render pages with a
+        # single headless browser (sequentially) to clear Redfin's JS challenge.
         if to_fetch:
-            label = "stale refresh" if all(stale for _, _, stale in to_fetch) else "fetch"
+            engine = "headless browser" if USE_BROWSER else "requests"
             print(f"\n  🏫 Fetching schools for {len(to_fetch)} listing(s) "
-                  f"(up to {MAX_SCHOOL_WORKERS} parallel)…")
-            with ThreadPoolExecutor(max_workers=MAX_SCHOOL_WORKERS) as executor:
-                futures = {
-                    executor.submit(fetch_listing_data, l["url"]): (i, l, cached)
-                    for i, l, cached in to_fetch
-                }
-                for future in as_completed(futures):
-                    i, l, cached = futures[future]
+                  f"via {engine}…")
+            with browser_session() as ctx:
+                for i, l, cached in to_fetch:
                     stale = cached is not None
-                    data = future.result()
+                    data = fetch_listing_data(l["url"], ctx)
                     schools = data["schools"]
                     blocked = data.get("blocked", False)
                     if blocked and cached:
