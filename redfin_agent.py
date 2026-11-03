@@ -445,15 +445,23 @@ def _fetch_listing_html(listing_url, ctx):
             return None, True
         return resp.text, False
 
+    def _safe_content():
+        # page.content() raises if read mid-navigation; treat as "not ready yet"
+        # and let the poll loop try again rather than failing the whole fetch.
+        try:
+            return page.content()
+        except Exception:
+            return ""
+
     page = ctx.new_page()
     try:
         page.goto(listing_url, wait_until="domcontentloaded", timeout=30000)
         deadline = time.time() + BROWSER_WAIT_SEC
-        html = page.content()
+        html = _safe_content()
         # Poll until the challenge clears and the real page renders, or we time out.
         while len(html) < MIN_RENDERED_BYTES and time.time() < deadline:
             page.wait_for_timeout(1000)
-            html = page.content()
+            html = _safe_content()
     finally:
         page.close()
 
@@ -950,7 +958,10 @@ def reenrich_blank_schools(limit=None):
     fetches are left untouched so they stay eligible for a later retry.
 
     `limit` caps how many blank listings to process (useful for a first pass).
+    Progress is flushed to the sheet and SQLite every FLUSH_EVERY listings, so
+    a long sweep that is interrupted still persists what it completed.
     """
+    FLUSH_EVERY = 20
     _, sheets = get_google_services()
     rows, addr_idx = read_sheet(sheets)
     listings = _sheet_rows_to_listings(rows)
@@ -969,9 +980,22 @@ def reenrich_blank_schools(limit=None):
           f"via {engine}…\n")
 
     today = datetime.now().strftime("%Y-%m-%d")
-    updated_listings = []   # listings whose data changed, for write-back
-    update_requests = []    # sheet batchUpdate payload
-    filled = blocked = still_empty = 0
+    pending_listings = []   # listings changed since last flush
+    pending_requests = []   # sheet batchUpdate payload since last flush
+    filled = blocked = still_empty = written = 0
+
+    def _flush():
+        nonlocal written
+        if pending_requests:
+            _with_retry(lambda: sheets.spreadsheets().values().batchUpdate(
+                spreadsheetId=SHEET_ID,
+                body={"valueInputOption": "USER_ENTERED", "data": pending_requests},
+            ).execute())
+        if pending_listings:
+            upsert_sqlite(pending_listings)
+            written += len(pending_requests)
+        pending_listings.clear()
+        pending_requests.clear()
 
     with browser_session() as ctx:
         for i, l in enumerate(blanks, 1):
@@ -989,12 +1013,12 @@ def reenrich_blank_schools(limit=None):
             l["hoa"] = data["hoa"] or l.get("hoa", "")
             l["property_type"] = data.get("property_type", "") or l.get("property_type", "")
             l["schools_updated"] = today   # successful fetch → stamp it
-            updated_listings.append(l)
+            pending_listings.append(l)
 
             key = normalise_address(l["address"])
             row_num = addr_idx.get(key)
             if row_num:
-                update_requests.append({
+                pending_requests.append({
                     "range": f"{SHEET_TAB}!A{row_num}:AC{row_num}",
                     "values": [listing_to_row(l)],
                 })
@@ -1006,18 +1030,14 @@ def reenrich_blank_schools(limit=None):
                 still_empty += 1
                 print(f"  [{i}/{len(blanks)}] {l['address']} → no schools (genuine)")
 
-    # Write back: sheet rows in one batch, then mirror to SQLite.
-    if update_requests:
-        _with_retry(lambda: sheets.spreadsheets().values().batchUpdate(
-            spreadsheetId=SHEET_ID,
-            body={"valueInputOption": "USER_ENTERED", "data": update_requests},
-        ).execute())
-    if updated_listings:
-        upsert_sqlite(updated_listings)
+            if len(pending_requests) >= FLUSH_EVERY:
+                _flush()
+
+    _flush()   # final partial batch
 
     print(f"\n✅ Re-enrich complete — {filled} filled, {still_empty} genuinely "
           f"school-less, {blocked} still blocked (will retry later). "
-          f"{len(update_requests)} row(s) written.")
+          f"{written} row(s) written.")
 
 
 # ─── RUN LOGGING ─────────────────────────────────────────────────────────────
